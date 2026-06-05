@@ -1,0 +1,20 @@
+output_dir: C:/Meetings
+recording:
+  fps: 20
+  video_codec: libx264
+  audio_sample_rate: 48000
+  mic_device: Микрофон (Realtek Audio)
+  system_audio_device: virtual-audio-capturer
+  screen_grabber: ddagrab
+transcription:
+  model: large-v3
+  language: ru
+  diarization: true
+  device: cuda
+llm:
+  backend: local
+  base_url: http://127.0.0.1:8080/v1
+  model: qwen2.5-14b-instruct
+  temperature: 0.3
+  max_tokens: 2048
+  clean_protocol: false

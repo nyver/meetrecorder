@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# Config & secrets
+config.yaml
+*.log
+meeting_recorder.log
+
+# Output
+Meetings/
+/tmp/Meetings/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sample data
+sample/*.wav
+sample/*.mp4
+
+# Environment
+.env
+.history
+.qwen

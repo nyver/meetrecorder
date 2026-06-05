@@ -1,0 +1,22 @@
+# Core dependencies
+pydantic>=2.5,<3
+pyyaml>=6.0,<7
+httpx>=0.27,<1
+rich>=13.0,<14
+
+# Transcription
+whisperx>=3.1.2,<4
+faster-whisper>=1.0.0,<2
+pyannote.audio>=3.1.0,<4
+torch>=2.1.0,<3
+torchaudio>=2.1.0,<3
+
+# LLM client (OpenAI SDK as alternative to httpx)
+openai>=1.10.0,<2
+
+# Audio processing
+soundfile>=0.12,<1
+numpy>=1.26,<2
+
+# CLI
+click>=8.1,<9
