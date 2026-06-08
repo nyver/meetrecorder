@@ -20,9 +20,11 @@ class RecordingConfig(BaseModel):
     fps: int = Field(default=20, ge=1, le=60)
     video_codec: str = "libx264"
     audio_sample_rate: int = Field(default=48000, ge=8000, le=192000)
-    mic_device: str = "Микрофон (Realtek Audio)"
+    mic_device: str = "Настольный микрофон (Microsoft® LifeCam HD-3000)"
     system_audio_device: str = "virtual-audio-capturer"
-    screen_grabber: Literal["ddagrab", "gdigrab"] = "ddagrab"
+    system_audio_grabber: Literal["dshow", "wasapi"] = "dshow"
+    record_system_audio: bool = True
+    screen_grabber: Literal["ddagrab", "gdigrab"] = "gdigrab"
 
 
 class TranscriptionConfig(BaseModel):
@@ -53,7 +55,7 @@ class LLMConfig(BaseModel):
     api_key: str = Field(default="")
     model: str = "qwen2.5-14b-instruct"
     temperature: float = Field(default=0.3, ge=0, le=2)
-    max_tokens: int = Field(default=2048, gt=0)
+    max_tokens: int = Field(default=16384, gt=0)
     clean_protocol: bool = False
 
     @model_validator(mode="after")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -79,6 +80,7 @@ class MeetingRecorder:
         self.config = config
         self.paths = paths
         self._process: Optional[subprocess.Popen[bytes]] = None
+        self._stderr_file = None
         self._recording = False
         self._start_time: Optional[float] = None
         self._stop_callback: Optional[callable] = None
@@ -93,11 +95,17 @@ class MeetingRecorder:
         cmd = self._build_ffmpeg_cmd()
         logger.info("Начинаю запись (ffmpeg cmd: %s ...)", " ".join(cmd[:4]))
 
+        self._stderr_file = open(str(self.paths.ffmpeg_log), "wb")
+        kwargs: dict = {}
+        if sys.platform == "win32":
+            # Отдельная process group нужна для CTRL_BREAK_EVENT при graceful stop
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=self._stderr_file,
+            **kwargs,
         )
         self._recording = True
         self._start_time = time.monotonic()
@@ -125,6 +133,12 @@ class MeetingRecorder:
             self._process.wait(timeout=5)
 
         self._recording = False
+        if self._stderr_file:
+            try:
+                self._stderr_file.close()
+            except Exception:
+                pass
+            self._stderr_file = None
         duration = time.monotonic() - self._start_time if self._start_time else 0
         logger.info(
             "Запись завершена: %s (длительность: %0.1f сек)",
@@ -136,6 +150,10 @@ class MeetingRecorder:
         return self._recording
 
     @property
+    def ffmpeg_pid(self) -> int | None:
+        return self._process.pid if self._process else None
+
+    @property
     def duration(self) -> float:
         if not self._recording or self._start_time is None:
             return 0.0
@@ -143,36 +161,72 @@ class MeetingRecorder:
 
     # -- internals ---------------------------------------------------------
 
+    def _system_audio_input(self, rc) -> list[str]:
+        if rc.system_audio_grabber == "wasapi":
+            # WASAPI loopback: захватывает системный аудиовыход без доп. драйверов
+            return ["-f", "wasapi", "-loopback", "1", "-i", "default"]
+        return ["-f", "dshow", "-i", f"audio={rc.system_audio_device}"]
+
     def _build_ffmpeg_cmd(self) -> list[str]:
         rc = self.config.recording
+
+        # Screen capture input differs by grabber
+        if rc.screen_grabber == "ddagrab":
+            # ddagrab: hardware DDA capture, input is display index
+            screen_input = ["-f", "ddagrab", "-framerate", str(rc.fps), "-i", "0"]
+            # hwdownload needed to get CPU-accessible frames for libx264
+            video_filters = ["-vf", "hwdownload,format=bgr0"]
+        else:
+            # gdigrab: GDI capture, supports draw_mouse
+            screen_input = [
+                "-f", "gdigrab",
+                "-framerate", str(rc.fps),
+                "-draw_mouse", "1",
+                "-i", "desktop",
+            ]
+            video_filters = []
+
         cmd: list[str] = [
-            "ffmpeg",
-            "-y",
-            # --- video: экран ---
-            "-f", rc.screen_grabber,
-            "-draw_mouse", "0",
-            "-i", "desktop",
-            # --- audio: микрофон (dshow) ---
-            "-f", "dshow",
-            "-i", f"audio={rc.mic_device}",
-            # --- audio: системный звук (loopback / virtual cable) ---
-            "-f", "dshow",
-            "-i", f"audio={rc.system_audio_device}",
-            # --- video codec ---
-            "-c:v", rc.video_codec,
-            "-r", str(rc.fps),
-            "-pix_fmt", "yuv420p",
-            # --- audio: перекодировать в WAV 16kHz PCM ---
-            "-c:a", "pcm_s16le",
-            "-ar", "48000",
-            "-ac", "1",
-            # --- map streams ---
-            "-map", "0:v:0",
-            "-map", "1:a:0",   # mic
-            "-map", "2:a:0",   # system
-            # --- output ---
-            str(self.paths.video),
+            "ffmpeg", "-y",
+            # --- input 0: screen ---
+            *screen_input,
+            # --- input 1: микрофон (dshow) ---
+            "-f", "dshow", "-i", f"audio={rc.mic_device}",
         ]
+
+        if rc.record_system_audio:
+            # --- input 2: системный звук ---
+            cmd += self._system_audio_input(rc)
+
+        cmd += [
+            # --- output 1: видео (без аудио) ---
+            "-map", "0:v:0",
+            *video_filters,
+            "-c:v", rc.video_codec,
+            "-pix_fmt", "yuv420p",
+            "-an",
+            # Fragmented MP4: moov не нужен в конце — файл валиден после force-kill
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            str(self.paths.video),
+
+            # --- output 2: микрофон WAV ---
+            "-map", "1:a:0",
+            "-c:a", "pcm_s16le",
+            "-ar", str(rc.audio_sample_rate),
+            "-ac", "1",
+            str(self.paths.mic_audio),
+        ]
+
+        if rc.record_system_audio:
+            cmd += [
+                # --- output 3: системный звук WAV ---
+                "-map", "2:a:0",
+                "-c:a", "pcm_s16le",
+                "-ar", str(rc.audio_sample_rate),
+                "-ac", "1",
+                str(self.paths.system_audio),
+            ]
+
         return cmd
 
     def get_status(self) -> dict:

@@ -124,7 +124,7 @@ def run_pipeline(
     t0 = time.monotonic()
 
     # Шаг 1: Запись
-    logger.info("=== ШАГ 1/4: Запись ===")
+    logger.info("=== ШАГ 1/3: Запись ===")
     t_start = time.monotonic()
     try:
         paths = run_record(cfg)
@@ -133,7 +133,7 @@ def run_pipeline(
     logger.info("Шаг 1 завершён за %.1f сек", time.monotonic() - t_start)
 
     # Шаг 2: Транскрипция
-    logger.info("=== ШАГ 2/4: Транскрипция ===")
+    logger.info("=== ШАГ 2/3: Транскрипция ===")
     t_start = time.monotonic()
     try:
         run_transcribe(cfg, paths)
@@ -141,8 +141,8 @@ def run_pipeline(
         raise PipelineError(f"Ошибка транскрипции: {e}") from e
     logger.info("Шаг 2 завершён за %.1f сек", time.monotonic() - t_start)
 
-    # Шаг 3: Протокол
-    logger.info("=== ШАГ 3/4: Протокол ===")
+    # Шаг 3: Протокол + Summary
+    logger.info("=== ШАГ 3/3: Протокол + Summary ===")
     t_start = time.monotonic()
     try:
         run_report(cfg, paths)

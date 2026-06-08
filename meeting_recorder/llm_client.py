@@ -22,11 +22,14 @@ class LLMClient:
 
     def __init__(self, config: LLMConfig):
         self.config = config
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
         self._client = httpx.Client(
-            base_url=config.base_url,
             timeout=httpx.Timeout(120.0, connect=10.0),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
+        self._base_url = config.base_url.rstrip("/")
 
     def chat(
         self,
@@ -36,7 +39,7 @@ class LLMClient:
         stream: bool = False,
     ) -> str:
         """Вызвать LLM и вернуть текст ответа."""
-        url = "/v1/chat/completions"
+        url = f"{self._base_url}/chat/completions"
 
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -72,9 +75,25 @@ class LLMClient:
             raise LLMClientError(f"Таймаут запроса к LLM: {e}") from e
 
         data = response.json()
-        content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        message = choice.get("message", {})
+        content = message.get("content") or ""
+
+        # Thinking-модели (DeepSeek-R1 и аналоги) пишут рассуждения в reasoning_content.
+        # Если content пуст и finish_reason == "length" — бюджет токенов закончился
+        # во время thinking-фазы. Нужно увеличить max_tokens в конфиге.
+        if not content:
+            reasoning = message.get("reasoning_content", "")
+            finish_reason = choice.get("finish_reason", "")
+            if reasoning and finish_reason == "length":
+                raise LLMClientError(
+                    f"Thinking-модель исчерпала бюджет токенов (max_tokens={self.config.max_tokens}) "
+                    f"во время reasoning-фазы — ответ не был сгенерирован. "
+                    f"Увеличьте max_tokens в config.yaml (рекомендуется >= 16384)."
+                )
+
         logger.info(
-            "LLM response: %d tokens (usage: %s)",
+            "LLM response: %d chars (usage: %s)",
             len(content),
             data.get("usage", {}),
         )
@@ -91,8 +110,8 @@ class LLMClient:
             with self._client.stream("POST", url, json=payload) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
-                    if line.startswith(b"data: "):
-                        data_str = line[6:].decode("utf-8").strip()
+                    if line.startswith("data: "):
+                        data_str = line[6:].strip()
                         if data_str == "[DONE]":
                             break
                         import json
@@ -107,7 +126,7 @@ class LLMClient:
     def health_check(self) -> bool:
         """Проверить, доступен ли LLM-бэкенд."""
         try:
-            resp = self._client.get("/v1/models", timeout=5.0)
+            resp = self._client.get(f"{self._base_url}/models", timeout=5.0)
             return resp.is_success
         except Exception:
             return False

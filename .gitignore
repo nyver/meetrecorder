@@ -40,3 +40,4 @@ sample/*.mp4
 .env
 .history
 .qwen
+.venv

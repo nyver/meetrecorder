@@ -6,15 +6,28 @@ import logging
 import textwrap
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
 from .naming import SessionPaths
 from .transcriber import load_transcript
 
+if TYPE_CHECKING:
+    from .llm_client import LLMClient
+
 logger = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def _session_datetime(session_id: str) -> datetime:
+    """Разобрать дату/время из session_id формата meeting_YYYY-MM-DD_HH-MM-SS."""
+    try:
+        # "meeting_2026-06-05_14-30-12" → "2026-06-05_14-30-12"
+        dt_str = session_id.split("_", 1)[1]
+        return datetime.strptime(dt_str, "%Y-%m-%d_%H-%M-%S")
+    except Exception:
+        return datetime.now()
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +70,7 @@ def generate_protocol(
         })
 
     # Формируем Markdown
-    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    date_str = _session_datetime(paths.session_id).strftime("%Y-%m-%d %H:%M")
     lines: list[str] = [
         f"# Протокол встречи — {date_str}",
         "",
@@ -144,8 +157,9 @@ def generate_summary(
     est_tokens = len(full_text.split()) * _WORDS_PER_TOKEN
 
     # Формируем метаданные
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    time_str = datetime.now().strftime("%H:%M")
+    meeting_dt = _session_datetime(paths.session_id)
+    date_str = meeting_dt.strftime("%Y-%m-%d")
+    time_str = meeting_dt.strftime("%H:%M")
     duration_min = data.get("duration_sec", 0) / 60.0
 
     unique_speakers = sorted({

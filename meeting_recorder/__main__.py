@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import sys
-import threading
 import time
+from pathlib import Path
+
+# Принудительно UTF-8 на Windows (иначе кириллица ломается в консоли)
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONUTF8", "1")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import click
-import yaml
 
 from meeting_recorder.config import AppConfig, load_config
 from meeting_recorder.naming import list_sessions, resolve_session
@@ -17,13 +27,43 @@ from meeting_recorder.pipeline import PipelineError, run_process, run_report_onl
 logger = logging.getLogger("meeting_recorder")
 
 # ---------------------------------------------------------------------------
-# Глобальный указатель на процесс записи (для stop)
+# Состояние записи (пersistence на диск)
 # ---------------------------------------------------------------------------
 
-_recorder_state: dict = {
-    "process": None,
-    "thread": None,
-}
+_STATE_DIR = Path(__file__).parent / ".state"
+_STATE_FILE = _STATE_DIR / "active_session.json"
+_STOP_FILE = _STATE_DIR / "stop_requested"
+
+
+def _ensure_state_dir() -> None:
+    _STATE_DIR.mkdir(exist_ok=True)
+
+
+def _save_state(session_id: str, video_path: str, ffmpeg_pid: int | None = None) -> None:
+    _ensure_state_dir()
+    _STATE_FILE.write_text(
+        json.dumps(
+            {"session_id": session_id, "video_path": video_path, "ffmpeg_pid": ffmpeg_pid},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _load_state() -> dict | None:
+    if not _STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _remove_state() -> None:
+    try:
+        _STATE_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -71,40 +111,114 @@ def cli(ctx, verbose, config_path):
     ctx.obj["cfg"] = cfg
 
 
+def _rename_with_retry(src: Path, dst: Path, retries: int = 10, delay: float = 0.5) -> None:
+    """Переименовать файл с повторными попытками (файл может быть временно заблокирован)."""
+    for attempt in range(retries):
+        try:
+            src.rename(dst)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
+
+
+def _stop_ffmpeg_graceful(pid: int, timeout: int = 15) -> bool:
+    """Graceful stop ffmpeg по PID через CTRL_BREAK_EVENT, затем ждём завершения.
+
+    CTRL_BREAK_EVENT позволяет ffmpeg финализировать контейнер и закрыть файлы.
+    Работает только если ffmpeg запущен с CREATE_NEW_PROCESS_GROUP.
+    Если процесс не завершился за timeout — форс-килл как запасной вариант.
+    """
+    import os
+    import signal
+    import subprocess as sp
+
+    try:
+        if sys.platform == "win32":
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        logger.debug("Сигнал остановки отправлен ffmpeg PID=%s", pid)
+    except (ProcessLookupError, PermissionError):
+        logger.info("ffmpeg PID=%s уже завершён", pid)
+        return True
+    except Exception as e:
+        logger.debug("Ошибка отправки сигнала PID=%s: %s", pid, e)
+
+    # Ждём завершения
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = sp.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True,
+        )
+        if str(pid) not in result.stdout:
+            logger.info("ffmpeg PID=%s завершился штатно", pid)
+            return True
+        time.sleep(0.5)
+
+    # Форс-килл как запасной вариант
+    logger.warning("ffmpeg PID=%s не завершился за %ds — принудительное завершение", pid, timeout)
+    try:
+        sp.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5)
+        time.sleep(1.5)  # Дать Windows время закрыть файловые хэндлы
+    except Exception as e:
+        logger.error("Принудительное завершение ffmpeg PID=%s не удалось: %s", pid, e)
+    return False
+
+
 @cli.command()
 @click.pass_context
 def start(ctx):
     """Начать запись экрана и звука."""
-    from meeting_recorder.pipeline import run_record
-
     cfg = ctx.obj["cfg"]
 
-    # Создаём сессию и запускаем запись в фоновом потоке
+    # Проверяем, нет ли уже идущей записи
+    existing = _load_state()
+    if existing:
+        sid = existing.get("session_id", "?")
+        print(f"⚠️ Уже идёт запись сессии: {sid}")
+        print(f"   Остановите её командой: mrec stop")
+        return
+
     from meeting_recorder.naming import create_session
     from meeting_recorder.recorder import MeetingRecorder
 
     paths = create_session(cfg.output_dir)
     recorder = MeetingRecorder(cfg, paths)
 
-    def _record_thread():
-        try:
-            recorder.start()
-            logger.info(
-                "Идёт запись: %s | длительность: %0.1f сек",
-                paths.session_id, recorder.duration,
-            )
-        except Exception as e:
-            logger.error("Ошибка записи: %s", e)
+    recorder.start()
+    ffmpeg_pid = recorder.ffmpeg_pid
 
-    _recorder_state["process"] = recorder
-    _recorder_state["thread"] = threading.Thread(target=_record_thread, daemon=True)
-    _recorder_state["thread"].start()
+    # Убираем старый stop-файл если остался с прошлого раза
+    _STOP_FILE.unlink(missing_ok=True)
 
-    logger.info("Запись начата: %s", paths.session_id)
+    # Сохраняем состояние на диск (включая PID для graceful stop)
+    _save_state(paths.session_id, str(paths.video), ffmpeg_pid)
+    logger.info("Запись начата: %s (ffmpeg PID=%s)", paths.session_id, ffmpeg_pid)
     logger.info("Остановите командой: mrec stop")
     print(f"\n✅ Запись начата: {paths.session_id}")
     print(f"   Папка: {paths.dir}")
     print(f"   Команда stop: mrec stop\n")
+
+    # Фоновый поток: ждём stop-файл, затем пишем 'q' в stdin ffmpeg
+    def _wait_for_stop():
+        while True:
+            time.sleep(0.5)
+            if _STOP_FILE.exists():
+                logger.info("Stop-файл обнаружен — останавливаю ffmpeg через stdin")
+                try:
+                    if recorder._process and recorder._process.stdin:
+                        recorder._process.stdin.write(b"q")
+                        recorder._process.stdin.flush()
+                except Exception as e:
+                    logger.debug("Ошибка записи 'q' в stdin: %s", e)
+                break
+
+    import threading
+    t = threading.Thread(target=_wait_for_stop, daemon=True)
+    t.start()
 
 
 @cli.command()
@@ -113,40 +227,92 @@ def stop(ctx):
     """Остановить запись и запустить полный пайплайн."""
     cfg = ctx.obj["cfg"]
 
-    recorder = _recorder_state.get("process")
-    if recorder is None or not recorder.is_recording:
+    # Загружаем состояние из файла
+    state = _load_state()
+    if state is None:
         print("⚠️ Запись не идёт. Нечего останавливать.")
         return
 
-    print("\n⏹ Останавливаю запись…")
-    recorder.stop()
-    _recorder_state["process"] = None
+    session_id = state.get("session_id")
+    ffmpeg_pid = state.get("ffmpeg_pid")
 
-    # Сводим аудио
+    if not session_id:
+        print("⚠️ Состояние записи повреждено. Удалите .state/active_session.json")
+        _remove_state()
+        return
+
+    print(f"\n⏹ Останавливаю запись сессии: {session_id}…")
+
+    # Шаг 1: создаём stop-файл → фоновый поток в mrec start пишет 'q' в stdin ffmpeg
+    _ensure_state_dir()
+    _STOP_FILE.touch()
+    time.sleep(3)  # Дать ffmpeg время обработать 'q' и финализировать файлы
+
+    # Шаг 2: fallback через CTRL_BREAK_EVENT если ffmpeg ещё жив
+    if ffmpeg_pid:
+        _stop_ffmpeg_graceful(int(ffmpeg_pid))
+    else:
+        logger.warning("PID ffmpeg не найден в состоянии — запись могла быть уже остановлена")
+
+    _STOP_FILE.unlink(missing_ok=True)
+
+    # Убираем состояние
+    _remove_state()
+
+    # Восстанавливаем пути
     from meeting_recorder.recorder import mix_audio_files
     from meeting_recorder.naming import resolve_session
 
-    paths = resolve_session(cfg.output_dir, recorder.paths.session_id)
+    try:
+        paths = resolve_session(cfg.output_dir, session_id)
+    except FileNotFoundError as e:
+        print(f"❌ Сессия не найдена: {e}")
+        return
 
+    # Сводим аудио
     print("🔊 Свожу аудио…")
-    if paths.mic_audio.exists() and paths.system_audio.exists():
-        mix_audio_files(
-            paths.mic_audio,
-            paths.system_audio,
-            paths.mix_audio,
-            cfg.recording.audio_sample_rate,
-        )
-    elif paths.mic_audio.exists():
-        paths.mic_audio.rename(paths.mix_audio)
+    mixed = False
+    try:
+        if paths.mic_audio.exists() and paths.system_audio.exists():
+            mix_audio_files(
+                paths.mic_audio,
+                paths.system_audio,
+                paths.mix_audio,
+                cfg.recording.audio_sample_rate,
+            )
+            mixed = True
+            logger.info("Аудио сведено: %s", paths.mix_audio)
+        elif paths.mic_audio.exists():
+            _rename_with_retry(paths.mic_audio, paths.mix_audio)
+            mixed = True
+            logger.info("Аудио (только микрофон): %s", paths.mix_audio)
+        elif paths.system_audio.exists():
+            _rename_with_retry(paths.system_audio, paths.mix_audio)
+            mixed = True
+            logger.info("Аудио (только системный звук): %s", paths.mix_audio)
+        else:
+            logger.warning("Аудиофайлы не найдены — ffmpeg не записал данные")
+    except Exception as e:
+        logger.warning("Не удалось свести аудио: %s", e)
 
-    logger.info("Аудио сведено: %s", paths.mix_audio)
+    if not mixed:
+        print(f"\n❌ Аудиофайлы не созданы — ffmpeg не смог записать данные.")
+        ffmpeg_log = paths.ffmpeg_log
+        if ffmpeg_log.exists():
+            tail = ffmpeg_log.read_text(errors="replace").splitlines()[-30:]
+            print(f"   Лог ffmpeg ({ffmpeg_log.name}):")
+            for line in tail:
+                print(f"     {line}")
+        else:
+            print(f"   Проверьте mic_device и system_audio_device в config.yaml")
+        print(f"   Папка сессии: {paths.dir}")
+        return
 
     # Запускаем пайплайн
     print("\n🚀 Запускаю пайплайн: транскрипция → протокол → summary…\n")
     try:
         from meeting_recorder.transcriber import transcribe
         from meeting_recorder.report import generate_protocol, generate_summary
-        import json
 
         # Транскрипция
         print("📝 Транскрипция…")

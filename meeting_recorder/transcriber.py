@@ -16,17 +16,17 @@ logger = logging.getLogger(__name__)
 _model_cache: dict[str, Any] = {}
 
 
-def _get_transcribe_model(device: str, dtype: str | None = None):
+def _get_transcribe_model(model_name: str, device: str, dtype: str | None = None):
     """Загрузить Whisper-модель с кэшированием."""
-    key = f"{device}_{dtype}"
+    key = f"{model_name}_{device}_{dtype}"
     if key in _model_cache:
         return _model_cache[key]
 
     from faster_whisper import WhisperModel
 
-    logger.info("Загрузка модели Whisper (device=%s, dtype=%s)…", device, dtype)
+    logger.info("Загрузка модели Whisper (model=%s, device=%s, dtype=%s)…", model_name, device, dtype)
     model = WhisperModel(
-        "large-v3",  # всегда large-v3 для лучшего качества
+        model_name,
         device=device,
         compute_type=dtype or ("float16" if device == "cuda" else "int8"),
         download_root=Path.home() / ".cache" / "whisper",
@@ -36,6 +36,52 @@ def _get_transcribe_model(device: str, dtype: str | None = None):
     return model
 
 
+def _patch_torchaudio_compat() -> None:
+    """Совместимость pyannote.audio 3.x с torchaudio 2.6+.
+
+    torchaudio 2.6+ убрал torchaudio.info / AudioMetaData / list_audio_backends.
+    Pyannote использует их как публичный API — патчим через soundfile.
+    """
+    import torchaudio
+    if hasattr(torchaudio, "AudioMetaData"):
+        return  # уже есть — ничего не делаем
+
+    from collections import namedtuple
+    import soundfile as sf
+    import torch
+
+    AudioMetaData = namedtuple(
+        "AudioMetaData",
+        ["sample_rate", "num_frames", "num_channels", "bits_per_sample", "encoding"],
+    )
+    torchaudio.AudioMetaData = AudioMetaData
+
+    def _info(path, backend=None, **kwargs):
+        info = sf.info(str(path))
+        return AudioMetaData(
+            sample_rate=info.samplerate,
+            num_frames=info.frames,
+            num_channels=info.channels,
+            bits_per_sample=16,
+            encoding="PCM_S",
+        )
+
+    def _load(path, frame_offset=0, num_frames=-1, normalize=True, **kwargs):
+        import numpy as np
+        start = frame_offset
+        frames = None if num_frames < 0 else num_frames
+        data, sr = sf.read(str(path), start=start, frames=frames, dtype="float32", always_2d=True)
+        tensor = torch.from_numpy(data.T)
+        return tensor, sr
+
+    def _list_audio_backends():
+        return ["soundfile"]
+
+    torchaudio.info = _info
+    torchaudio.load = _load
+    torchaudio.list_audio_backends = _list_audio_backends
+
+
 def _get_diarization_model(cfg: AppConfig):
     """Загрузить pyannote.audio диаризацию с кэшированием."""
     key = "diarization"
@@ -43,9 +89,10 @@ def _get_diarization_model(cfg: AppConfig):
         return _model_cache[key]
 
     try:
+        _patch_torchaudio_compat()
         from pyannote.audio import Pipeline
-    except ImportError:
-        logger.warning("pyannote.audio не установлен — диаризация отключена")
+    except (ImportError, Exception) as e:
+        logger.warning("pyannote.audio недоступна — диаризация отключена: %s", e)
         return None
 
     hf_token = cfg.transcription.hf_token
@@ -59,9 +106,13 @@ def _get_diarization_model(cfg: AppConfig):
     logger.info("Загрузка pyannote.pipeline (device=%s)…", cfg.transcription.device)
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        token=hf_token,
+        use_auth_token=hf_token,
     )
-    pipeline.to_device()
+    try:
+        import torch
+        pipeline.to(torch.device(cfg.transcription.device))
+    except Exception as e:
+        logger.warning("Не удалось перенести pyannote на %s: %s", cfg.transcription.device, e)
     _model_cache[key] = pipeline
     logger.info("pyannote.pipeline загружена")
     return pipeline
@@ -121,7 +172,7 @@ def transcribe(
             device = "cpu"
 
     # Загрузка модели Whisper
-    model = _get_transcribe_model(device)
+    model = _get_transcribe_model(tcfg.model, device)
 
     logger.info(
         "Начинаю транскрипцию: %s (language=%s, device=%s)",
