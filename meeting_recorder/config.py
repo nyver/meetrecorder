@@ -22,7 +22,7 @@ class RecordingConfig(BaseModel):
     audio_sample_rate: int = Field(default=48000, ge=8000, le=192000)
     mic_device: str = "Настольный микрофон (Microsoft® LifeCam HD-3000)"
     system_audio_device: str = "virtual-audio-capturer"
-    system_audio_grabber: Literal["dshow", "wasapi"] = "dshow"
+    system_audio_grabber: Literal["dshow", "wasapi", "soundcard"] = "soundcard"
     record_system_audio: bool = True
     screen_grabber: Literal["ddagrab", "gdigrab"] = "gdigrab"
 

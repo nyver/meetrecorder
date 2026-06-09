@@ -33,6 +33,7 @@ logger = logging.getLogger("meeting_recorder")
 _STATE_DIR = Path(__file__).parent / ".state"
 _STATE_FILE = _STATE_DIR / "active_session.json"
 _STOP_FILE = _STATE_DIR / "stop_requested"
+_DONE_FILE = _STATE_DIR / "recording_done"
 
 
 def _ensure_state_dir() -> None:
@@ -188,37 +189,32 @@ def start(ctx):
     paths = create_session(cfg.output_dir)
     recorder = MeetingRecorder(cfg, paths)
 
+    _STOP_FILE.unlink(missing_ok=True)
+    _DONE_FILE.unlink(missing_ok=True)
+
     recorder.start()
     ffmpeg_pid = recorder.ffmpeg_pid
 
-    # Убираем старый stop-файл если остался с прошлого раза
-    _STOP_FILE.unlink(missing_ok=True)
-
-    # Сохраняем состояние на диск (включая PID для graceful stop)
     _save_state(paths.session_id, str(paths.video), ffmpeg_pid)
     logger.info("Запись начата: %s (ffmpeg PID=%s)", paths.session_id, ffmpeg_pid)
-    logger.info("Остановите командой: mrec stop")
     print(f"\n✅ Запись начата: {paths.session_id}")
     print(f"   Папка: {paths.dir}")
-    print(f"   Команда stop: mrec stop\n")
+    print(f"   Остановить: mrec stop  (или Ctrl+C)\n")
 
-    # Фоновый поток: ждём stop-файл, затем пишем 'q' в stdin ffmpeg
-    def _wait_for_stop():
-        while True:
+    # Блокируем до получения сигнала остановки
+    try:
+        while not _STOP_FILE.exists():
             time.sleep(0.5)
-            if _STOP_FILE.exists():
-                logger.info("Stop-файл обнаружен — останавливаю ffmpeg через stdin")
-                try:
-                    if recorder._process and recorder._process.stdin:
-                        recorder._process.stdin.write(b"q")
-                        recorder._process.stdin.flush()
-                except Exception as e:
-                    logger.debug("Ошибка записи 'q' в stdin: %s", e)
-                break
-
-    import threading
-    t = threading.Thread(target=_wait_for_stop, daemon=True)
-    t.start()
+        logger.info("Stop-сигнал получен — останавливаю запись")
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt — останавливаю запись")
+    finally:
+        # Останавливаем ffmpeg И soundcard-захват, ждём сохранения файлов
+        recorder.stop()
+        _DONE_FILE.touch()
+        _STOP_FILE.unlink(missing_ok=True)
+        _remove_state()
+        logger.info("Запись завершена: %s", paths.session_id)
 
 
 @cli.command()
@@ -243,21 +239,27 @@ def stop(ctx):
 
     print(f"\n⏹ Останавливаю запись сессии: {session_id}…")
 
-    # Шаг 1: создаём stop-файл → фоновый поток в mrec start пишет 'q' в stdin ffmpeg
     _ensure_state_dir()
+    _DONE_FILE.unlink(missing_ok=True)
     _STOP_FILE.touch()
-    time.sleep(3)  # Дать ffmpeg время обработать 'q' и финализировать файлы
 
-    # Шаг 2: fallback через CTRL_BREAK_EVENT если ffmpeg ещё жив
-    if ffmpeg_pid:
-        _stop_ffmpeg_graceful(int(ffmpeg_pid))
+    # Ждём пока mrec start завершит остановку ffmpeg + soundcard и сохранит файлы
+    print("⏳ Ожидаю завершения записи…")
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        if _DONE_FILE.exists():
+            logger.info("Запись завершена штатно")
+            break
     else:
-        logger.warning("PID ffmpeg не найден в состоянии — запись могла быть уже остановлена")
+        # Таймаут: mrec start не ответил — принудительно останавливаем ffmpeg
+        logger.warning("Таймаут ожидания mrec start — принудительная остановка ffmpeg")
+        if ffmpeg_pid:
+            _stop_ffmpeg_graceful(int(ffmpeg_pid))
+        _remove_state()
 
+    _DONE_FILE.unlink(missing_ok=True)
     _STOP_FILE.unlink(missing_ok=True)
-
-    # Убираем состояние
-    _remove_state()
 
     # Восстанавливаем пути
     from meeting_recorder.recorder import mix_audio_files

@@ -20,6 +20,58 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Захват системного аудио через WASAPI loopback (soundcard)
+# ---------------------------------------------------------------------------
+
+
+class SystemAudioCapture:
+    """Запись системного аудио (WASAPI loopback) в отдельном потоке."""
+
+    CHUNK_FRAMES = 4800  # 100 мс при 48 кГц
+
+    def __init__(self, output_path: Path, sample_rate: int = 48000):
+        self._path = output_path
+        self._sr = sample_rate
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.error: Optional[Exception] = None
+
+    def start(self) -> None:
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._record, daemon=True, name="sys-audio")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=10)
+
+    def _record(self) -> None:
+        try:
+            import soundcard as sc
+
+            speaker = sc.default_speaker()
+            loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+            logger.info("Захват системного аудио: %s", speaker.name)
+
+            chunks: list[np.ndarray] = []
+            with loopback.recorder(samplerate=self._sr, channels=1, blocksize=self.CHUNK_FRAMES) as rec:
+                while not self._stop_event.is_set():
+                    chunk = rec.record(numframes=self.CHUNK_FRAMES)
+                    chunks.append(chunk)
+
+            if chunks:
+                audio = np.concatenate(chunks)
+                sf.write(str(self._path), audio, self._sr, subtype="PCM_16")
+                logger.info("Системный звук сохранён: %s (%.1f сек)", self._path, len(audio) / self._sr)
+            else:
+                logger.warning("Системный звук: нет данных")
+        except Exception as exc:
+            self.error = exc
+            logger.error("Ошибка захвата системного аудио: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Утилиты аудио
 # ---------------------------------------------------------------------------
 
@@ -84,6 +136,7 @@ class MeetingRecorder:
         self._recording = False
         self._start_time: Optional[float] = None
         self._stop_callback: Optional[callable] = None
+        self._sys_capture: Optional[SystemAudioCapture] = None
 
     # -- публичные методы --------------------------------------------------
 
@@ -91,6 +144,13 @@ class MeetingRecorder:
         """Начать запись экрана + микрофон + системный звук."""
         if self._recording:
             raise RuntimeError("Запись уже идёт")
+
+        rc = self.config.recording
+
+        # Запуск soundcard-захвата системного аудио (до ffmpeg, чтобы не пропустить начало)
+        if rc.record_system_audio and rc.system_audio_grabber == "soundcard":
+            self._sys_capture = SystemAudioCapture(self.paths.system_audio, rc.audio_sample_rate)
+            self._sys_capture.start()
 
         cmd = self._build_ffmpeg_cmd()
         logger.info("Начинаю запись (ffmpeg cmd: %s ...)", " ".join(cmd[:4]))
@@ -139,6 +199,14 @@ class MeetingRecorder:
             except Exception:
                 pass
             self._stderr_file = None
+
+        # Остановить soundcard-захват (ждём завершения записи в файл)
+        if self._sys_capture is not None:
+            self._sys_capture.stop()
+            if self._sys_capture.error:
+                logger.error("Системный звук не записан: %s", self._sys_capture.error)
+            self._sys_capture = None
+
         duration = time.monotonic() - self._start_time if self._start_time else 0
         logger.info(
             "Запись завершена: %s (длительность: %0.1f сек)",
@@ -194,8 +262,8 @@ class MeetingRecorder:
             "-f", "dshow", "-i", f"audio={rc.mic_device}",
         ]
 
-        if rc.record_system_audio:
-            # --- input 2: системный звук ---
+        if rc.record_system_audio and rc.system_audio_grabber != "soundcard":
+            # --- input 2: системный звук (dshow/wasapi) ---
             cmd += self._system_audio_input(rc)
 
         cmd += [
@@ -217,7 +285,7 @@ class MeetingRecorder:
             str(self.paths.mic_audio),
         ]
 
-        if rc.record_system_audio:
+        if rc.record_system_audio and rc.system_audio_grabber != "soundcard":
             cmd += [
                 # --- output 3: системный звук WAV ---
                 "-map", "2:a:0",

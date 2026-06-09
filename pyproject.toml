@@ -26,6 +26,7 @@ dependencies = [
     "torchaudio>=2.1.0,<3",
     "numpy>=1.26,<2",
     "soundfile>=0.12,<1",
+    "soundcard>=0.4.3",
 ]
 
 [project.optional-dependencies]
