@@ -69,7 +69,8 @@ def _patch_torchaudio_compat() -> None:
     def _load(path, frame_offset=0, num_frames=-1, normalize=True, **kwargs):
         import numpy as np
         start = frame_offset
-        frames = None if num_frames < 0 else num_frames
+        # soundfile использует -1 для «читать всё», None недопустим
+        frames = -1 if (num_frames is None or num_frames < 0) else num_frames
         data, sr = sf.read(str(path), start=start, frames=frames, dtype="float32", always_2d=True)
         tensor = torch.from_numpy(data.T)
         return tensor, sr
@@ -82,6 +83,85 @@ def _patch_torchaudio_compat() -> None:
     torchaudio.list_audio_backends = _list_audio_backends
 
 
+def _patch_hf_use_auth_token() -> None:
+    """huggingface_hub 1.x убрал use_auth_token — патчим для совместимости с pyannote 3.x."""
+    try:
+        import inspect
+        import huggingface_hub as hfh
+        if "use_auth_token" in inspect.signature(hfh.hf_hub_download).parameters:
+            return
+
+        _orig = hfh.hf_hub_download
+
+        def _patched(*args, use_auth_token=None, **kwargs):
+            if use_auth_token is not None and "token" not in kwargs:
+                kwargs["token"] = use_auth_token
+            return _orig(*args, **kwargs)
+
+        hfh.hf_hub_download = _patched
+        try:
+            import pyannote.audio.core.pipeline as _pa
+            if hasattr(_pa, "hf_hub_download"):
+                _pa.hf_hub_download = _patched
+        except ImportError:
+            pass
+    except Exception as e:
+        logger.debug("Патч hf_hub не применён: %s", e)
+
+
+def _patch_torch_load_compat() -> None:
+    """PyTorch 2.6+ сменил weights_only=True по умолчанию — pyannote чекпоинты не грузятся.
+
+    Патчим torch.load глобально: устанавливаем weights_only=False по умолчанию.
+    pl_load в pyannote — прямая ссылка, поэтому патчить cloud_io бесполезно.
+    """
+    try:
+        import torch
+
+        if getattr(torch, "_patched_weights_only", False):
+            return
+
+        _orig_load = torch.load
+
+        def _patched_load(*args, **kwargs):
+            kwargs["weights_only"] = False
+            return _orig_load(*args, **kwargs)
+
+        torch.load = _patched_load
+        torch._patched_weights_only = True
+    except Exception as e:
+        logger.debug("Патч torch.load не применён: %s", e)
+
+
+def _patch_speechbrain_lazy_module() -> None:
+    """speechbrain LazyModule.__getattr__ кидает ImportError для дандер-атрибутов (__file__ и др.)
+
+    inspect.stack() → hasattr(module, '__file__') → ImportError (k2/flair/etc. не установлены).
+    Патч: для дандер-атрибутов перехватываем ImportError и поднимаем AttributeError,
+    чтобы hasattr() корректно вернул False.
+    """
+    try:
+        from speechbrain.utils.importutils import LazyModule
+
+        if getattr(LazyModule, "_patched_dunder", False):
+            return
+
+        _orig_getattr = LazyModule.__getattr__
+
+        def _safe_getattr(self, attr):
+            if attr.startswith("__") and attr.endswith("__"):
+                try:
+                    return _orig_getattr(self, attr)
+                except (ImportError, Exception):
+                    raise AttributeError(attr)
+            return _orig_getattr(self, attr)
+
+        LazyModule.__getattr__ = _safe_getattr
+        LazyModule._patched_dunder = True
+    except Exception as e:
+        logger.debug("Патч speechbrain LazyModule не применён: %s", e)
+
+
 def _get_diarization_model(cfg: AppConfig):
     """Загрузить pyannote.audio диаризацию с кэшированием."""
     key = "diarization"
@@ -90,6 +170,9 @@ def _get_diarization_model(cfg: AppConfig):
 
     try:
         _patch_torchaudio_compat()
+        _patch_hf_use_auth_token()
+        _patch_torch_load_compat()
+        _patch_speechbrain_lazy_module()
         from pyannote.audio import Pipeline
     except (ImportError, Exception) as e:
         logger.warning("pyannote.audio недоступна — диаризация отключена: %s", e)
@@ -254,16 +337,10 @@ def _apply_diarization(
     cfg: AppConfig,
 ) -> list[Segment]:
     """Применить pyannote.audio диаризацию к сегментам Whisper."""
-    from pyannote.audio import Audio
-
     logger.info("Выполняю диаризацию на %s…", audio_path.name)
 
-    # Загружаем аудио для pipeline
-    audio = Audio(sample_rate=16000, mono=True)
-    snippet = audio.crop(audio_path, duration=None)
-
-    # Запускаем пайплайн диаризации
-    diarization = pipeline(snippet)
+    # pyannote 3.x: передаём путь напрямую
+    diarization = pipeline(str(audio_path))
 
     # Создаем карту: segment_index → set of speakers
     speaker_map: dict[int, set[str]] = {i: set() for i in range(len(segments))}
