@@ -57,6 +57,7 @@ class LLMConfig(BaseModel):
     temperature: float = Field(default=0.3, ge=0, le=2)
     max_tokens: int = Field(default=16384, gt=0)
     clean_protocol: bool = False
+    timeout: float = Field(default=300.0, gt=0)
 
     @model_validator(mode="after")
     def _resolve_api_key(self) -> "LLMConfig":

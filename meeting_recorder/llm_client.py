@@ -26,7 +26,7 @@ class LLMClient:
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
         self._client = httpx.Client(
-            timeout=httpx.Timeout(120.0, connect=10.0),
+            timeout=httpx.Timeout(config.timeout, connect=10.0),
             headers=headers,
         )
         self._base_url = config.base_url.rstrip("/")
