@@ -385,6 +385,148 @@ def report_cmd(ctx, session_id: str):
     print(f"   Summary:  {summary}")
 
 
+def _build_chat_system_prompt(paths, cfg) -> str:
+    """Сформировать системный промпт для чата по данным встречи."""
+    import json as _json
+    from datetime import datetime
+
+    session_id = paths.session_id
+    try:
+        dt_str = session_id.split("_", 1)[1]
+        meeting_dt = datetime.strptime(dt_str, "%Y-%m-%d_%H-%M-%S")
+        date_str = meeting_dt.strftime("%Y-%m-%d")
+        time_str = meeting_dt.strftime("%H:%M")
+    except Exception:
+        date_str = time_str = "?"
+
+    lines = [
+        "Ты — аналитик встречи. Отвечай на вопросы пользователя строго по данным встречи ниже.",
+        "Если информации нет в материалах — скажи об этом прямо. Отвечай на том же языке, на котором задан вопрос.",
+        "",
+        f"## Метаданные",
+        f"Сессия: {session_id}",
+        f"Дата: {date_str}  Время: {time_str}",
+    ]
+
+    # Транскрипт
+    if paths.transcript.exists():
+        data = _json.loads(paths.transcript.read_text(encoding="utf-8"))
+        segments = data.get("segments", [])
+        duration_min = data.get("duration_sec", 0) / 60
+        lines.append(f"Длительность: {duration_min:.0f} мин")
+
+        speaker_names = cfg.transcription.speaker_names
+        unique_speakers = sorted({seg.get("speaker", "UNKNOWN") for seg in segments})
+        named = [speaker_names.get(s, s) for s in unique_speakers]
+        lines.append(f"Участники: {', '.join(named)}")
+        lines += ["", "## Транскрипт"]
+
+        for seg in segments:
+            speaker = seg.get("speaker", "UNKNOWN")
+            speaker = speaker_names.get(speaker, speaker)
+            start = int(seg["start"])
+            ts = f"{start // 60:02d}:{start % 60:02d}"
+            lines.append(f"[{ts}] {speaker}: {seg['text'].strip()}")
+    else:
+        lines.append("Длительность: ?")
+
+    # Протокол (только если нет транскрипта или как дополнение)
+    if paths.protocol.exists() and not paths.transcript.exists():
+        lines += ["", "## Протокол"]
+        lines.append(paths.protocol.read_text(encoding="utf-8"))
+
+    # Summary
+    if paths.summary.exists():
+        lines += ["", "## Summary"]
+        lines.append(paths.summary.read_text(encoding="utf-8"))
+
+    return "\n".join(lines)
+
+
+@cli.command("chat")
+@click.argument("session_id", required=False, default=None)
+@click.pass_context
+def chat_cmd(ctx, session_id: str | None):
+    """Чат с LLM по данным встречи (транскрипт, протокол, summary).
+
+    SESSION_ID — идентификатор сессии (по умолчанию последняя).
+    Введите вопрос и нажмите Enter. Для выхода — 'exit' или Ctrl+C.
+    """
+    from meeting_recorder.llm_client import LLMClientError, create_llm_client
+
+    cfg = ctx.obj["cfg"]
+
+    if session_id is None:
+        sessions = list_sessions(cfg.output_dir)
+        if not sessions:
+            print(f"❌ Сессий не найдено в {cfg.output_dir}")
+            sys.exit(1)
+        session_id = sessions[-1].session_id
+        print(f"ℹ Используется последняя сессия: {session_id}")
+
+    try:
+        paths = resolve_session(cfg.output_dir, session_id)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    has_transcript = paths.transcript.exists()
+    has_summary = paths.summary.exists()
+    if not has_transcript and not has_summary and not paths.protocol.exists():
+        print(f"❌ Нет данных для сессии {session_id}.")
+        print(f"   Сначала выполните транскрипцию: mrec process {session_id}")
+        sys.exit(1)
+
+    print(f"\n💬 Чат по встрече: {session_id}")
+    ctx_parts = []
+    if has_transcript:
+        ctx_parts.append("транскрипт")
+    if paths.protocol.exists():
+        ctx_parts.append("протокол")
+    if has_summary:
+        ctx_parts.append("summary")
+    print(f"   Контекст: {', '.join(ctx_parts)}")
+    print(f"   Модель:   {cfg.llm.model}")
+    print(f"   Для выхода введите 'exit' или нажмите Ctrl+C\n")
+
+    system_prompt = _build_chat_system_prompt(paths, cfg)
+    history: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+    try:
+        client = create_llm_client(cfg.llm)
+    except LLMClientError as e:
+        print(f"❌ LLM недоступен: {e}")
+        sys.exit(1)
+
+    try:
+        while True:
+            try:
+                user_input = input("Вы: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n👋 Выход.")
+                break
+
+            if not user_input:
+                continue
+            if user_input.lower() in {"exit", "quit", "выход", "q"}:
+                print("👋 Выход.")
+                break
+
+            history.append({"role": "user", "content": user_input})
+
+            try:
+                answer = client.chat(history)
+            except LLMClientError as e:
+                print(f"❌ Ошибка LLM: {e}\n")
+                history.pop()
+                continue
+
+            history.append({"role": "assistant", "content": answer})
+            print(f"\nАссистент: {answer}\n")
+    finally:
+        client.close()
+
+
 @cli.command("mux")
 @click.argument("session_id", required=False, default=None)
 @click.pass_context
