@@ -320,6 +320,31 @@ class MeetingRecorder:
 # ---------------------------------------------------------------------------
 
 
+def mux_video(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+) -> Path:
+    """Объединить видео и аудио в один MP4-файл (без перекодирования видео)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg завершился с ошибкой:\n{result.stderr[-1000:]}"
+        )
+    logger.info("Финальное видео сохранено: %s", output_path)
+    return output_path
+
+
 def split_streams(video_path: Path, paths: SessionPaths) -> tuple[Path, Path]:
     """Извлечь аудио-дорожки из одного video-файла (если ffmpeg записал всё в один файл).
 

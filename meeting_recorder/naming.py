@@ -50,6 +50,7 @@ class SessionPaths:
         self.system_audio = self.dir / f"{session_id}_system.wav"
         self.mix_audio = self.dir / f"{session_id}_mix.wav"
         self.ffmpeg_log = self.dir / f"{session_id}_ffmpeg.log"
+        self.final_video = self.dir / f"{session_id}_final.mp4"
         self.transcript = self.dir / f"{session_id}_transcript.json"
         self.protocol = self.dir / f"{session_id}_protocol.md"
         self.summary = self.dir / f"{session_id}_summary.md"

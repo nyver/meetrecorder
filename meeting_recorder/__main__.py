@@ -385,6 +385,50 @@ def report_cmd(ctx, session_id: str):
     print(f"   Summary:  {summary}")
 
 
+@cli.command("mux")
+@click.argument("session_id", required=False, default=None)
+@click.pass_context
+def mux_cmd(ctx, session_id: str | None):
+    """Свести финальное аудио (mix) с видео в один MP4.
+
+    SESSION_ID — идентификатор сессии (по умолчанию последняя).
+    """
+    from meeting_recorder.recorder import mux_video
+
+    cfg = ctx.obj["cfg"]
+
+    if session_id is None:
+        sessions = list_sessions(cfg.output_dir)
+        if not sessions:
+            print(f"❌ Сессий не найдено в {cfg.output_dir}")
+            sys.exit(1)
+        session_id = sessions[-1].session_id
+        print(f"ℹ Используется последняя сессия: {session_id}")
+
+    try:
+        paths = resolve_session(cfg.output_dir, session_id)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    if not paths.video.exists():
+        print(f"❌ Видеофайл не найден: {paths.video}")
+        sys.exit(1)
+
+    if not paths.mix_audio.exists():
+        print(f"❌ Аудиофайл (mix) не найден: {paths.mix_audio}")
+        sys.exit(1)
+
+    print(f"🎬 Свожу видео + аудио → {paths.final_video.name}…")
+    try:
+        out = mux_video(paths.video, paths.mix_audio, paths.final_video)
+        size_mb = out.stat().st_size / 1024 / 1024
+        print(f"✅ Готово: {out}  ({size_mb:.1f} МБ)")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        sys.exit(1)
+
+
 @cli.command("list")
 @click.pass_context
 def list_cmd(ctx):
