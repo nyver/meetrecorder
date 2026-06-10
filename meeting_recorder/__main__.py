@@ -217,33 +217,12 @@ def start(ctx):
         logger.info("Запись завершена: %s", paths.session_id)
 
 
-@cli.command()
-@click.pass_context
-def stop(ctx):
-    """Остановить запись и запустить полный пайплайн."""
-    cfg = ctx.obj["cfg"]
-
-    # Загружаем состояние из файла
-    state = _load_state()
-    if state is None:
-        print("⚠️ Запись не идёт. Нечего останавливать.")
-        return
-
-    session_id = state.get("session_id")
-    ffmpeg_pid = state.get("ffmpeg_pid")
-
-    if not session_id:
-        print("⚠️ Состояние записи повреждено. Удалите .state/active_session.json")
-        _remove_state()
-        return
-
-    print(f"\n⏹ Останавливаю запись сессии: {session_id}…")
-
+def _signal_stop_and_wait(ffmpeg_pid: int | None) -> None:
+    """Послать stop-сигнал процессу mrec start и дождаться завершения записи."""
     _ensure_state_dir()
     _DONE_FILE.unlink(missing_ok=True)
     _STOP_FILE.touch()
 
-    # Ждём пока mrec start завершит остановку ffmpeg + soundcard и сохранит файлы
     print("⏳ Ожидаю завершения записи…")
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -252,7 +231,6 @@ def stop(ctx):
             logger.info("Запись завершена штатно")
             break
     else:
-        # Таймаут: mrec start не ответил — принудительно останавливаем ffmpeg
         logger.warning("Таймаут ожидания mrec start — принудительная остановка ffmpeg")
         if ffmpeg_pid:
             _stop_ffmpeg_graceful(int(ffmpeg_pid))
@@ -261,19 +239,12 @@ def stop(ctx):
     _DONE_FILE.unlink(missing_ok=True)
     _STOP_FILE.unlink(missing_ok=True)
 
-    # Восстанавливаем пути
+
+def _mix_session_audio(paths, cfg) -> bool:
+    """Свести аудиодорожки сессии. Возвращает True при успехе."""
     from meeting_recorder.recorder import mix_audio_files
-    from meeting_recorder.naming import resolve_session
 
-    try:
-        paths = resolve_session(cfg.output_dir, session_id)
-    except FileNotFoundError as e:
-        print(f"❌ Сессия не найдена: {e}")
-        return
-
-    # Сводим аудио
     print("🔊 Свожу аудио…")
-    mixed = False
     try:
         if paths.mic_audio.exists() and paths.system_audio.exists():
             mix_audio_files(
@@ -282,24 +253,90 @@ def stop(ctx):
                 paths.mix_audio,
                 cfg.recording.audio_sample_rate,
             )
-            mixed = True
             logger.info("Аудио сведено: %s", paths.mix_audio)
         elif paths.mic_audio.exists():
             _rename_with_retry(paths.mic_audio, paths.mix_audio)
-            mixed = True
             logger.info("Аудио (только микрофон): %s", paths.mix_audio)
         elif paths.system_audio.exists():
             _rename_with_retry(paths.system_audio, paths.mix_audio)
-            mixed = True
             logger.info("Аудио (только системный звук): %s", paths.mix_audio)
         else:
             logger.warning("Аудиофайлы не найдены — ffmpeg не записал данные")
+            return False
     except Exception as e:
         logger.warning("Не удалось свести аудио: %s", e)
+        return False
+    return True
 
-    if not mixed:
-        print(f"\n❌ Аудиофайлы не созданы — ffmpeg не смог записать данные.")
+
+def _load_active_session(cfg) -> tuple[str | None, int | None, object | None]:
+    """Загрузить активную сессию. Возвращает (session_id, ffmpeg_pid, paths)."""
+    from meeting_recorder.naming import resolve_session
+
+    state = _load_state()
+    if state is None:
+        print("⚠️ Запись не идёт. Нечего останавливать.")
+        return None, None, None
+
+    session_id = state.get("session_id")
+    ffmpeg_pid = state.get("ffmpeg_pid")
+
+    if not session_id:
+        print("⚠️ Состояние записи повреждено. Удалите .state/active_session.json")
+        _remove_state()
+        return None, None, None
+
+    print(f"\n⏹ Останавливаю запись сессии: {session_id}…")
+
+    try:
+        paths = resolve_session(cfg.output_dir, session_id)
+    except FileNotFoundError as e:
+        print(f"❌ Сессия не найдена: {e}")
+        return None, None, None
+
+    return session_id, ffmpeg_pid, paths
+
+
+@cli.command("stop-only")
+@click.pass_context
+def stop_only_cmd(ctx):
+    """Остановить запись и свести аудио — без транскрипции и отчёта."""
+    cfg = ctx.obj["cfg"]
+
+    session_id, ffmpeg_pid, paths = _load_active_session(cfg)
+    if paths is None:
+        return
+
+    _signal_stop_and_wait(ffmpeg_pid)
+
+    if not _mix_session_audio(paths, cfg):
         ffmpeg_log = paths.ffmpeg_log
+        print(f"\n❌ Аудиофайлы не созданы.")
+        if ffmpeg_log.exists():
+            for line in ffmpeg_log.read_text(errors="replace").splitlines()[-20:]:
+                print(f"     {line}")
+        print(f"   Папка сессии: {paths.dir}")
+        return
+
+    print(f"\n✅ Запись остановлена: {paths.dir}")
+    print(f"   Чтобы обработать позже: mrec process {session_id}")
+
+
+@cli.command()
+@click.pass_context
+def stop(ctx):
+    """Остановить запись и запустить полный пайплайн."""
+    cfg = ctx.obj["cfg"]
+
+    session_id, ffmpeg_pid, paths = _load_active_session(cfg)
+    if paths is None:
+        return
+
+    _signal_stop_and_wait(ffmpeg_pid)
+
+    if not _mix_session_audio(paths, cfg):
+        ffmpeg_log = paths.ffmpeg_log
+        print(f"\n❌ Аудиофайлы не созданы — ffmpeg не смог записать данные.")
         if ffmpeg_log.exists():
             tail = ffmpeg_log.read_text(errors="replace").splitlines()[-30:]
             print(f"   Лог ffmpeg ({ffmpeg_log.name}):")
@@ -589,6 +626,27 @@ def list_cmd(ctx):
         date_part = s.session_id.split("_", 1)[1] if "_" in s.session_id else s.session_id
         print(f"{s.session_id:<35} {date_part:<12} {file_count:>5} файлов")
     print()
+
+
+@cli.command("tray")
+@click.pass_context
+def tray_cmd(ctx):
+    """Запустить Meeting Recorder в режиме иконки системного трея.
+
+    Иконка меняет цвет в зависимости от состояния:
+      серый — ожидание, красный — запись, оранжевый — обработка.
+    Меню позволяет начать/остановить запись и открыть папку встреч.
+    """
+    try:
+        import pystray  # noqa: F401
+    except ImportError:
+        print("❌ pystray не установлен.")
+        print("   Установите: pip install pystray")
+        sys.exit(1)
+
+    cfg = ctx.obj["cfg"]
+    from meeting_recorder.tray import TrayApp
+    TrayApp(cfg).run()
 
 
 @cli.command("generate-config")
