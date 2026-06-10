@@ -21,6 +21,40 @@ class PipelineError(Exception):
     """Ошибка пайплайна."""
 
 
+def _check_video_length(paths: "SessionPaths") -> None:
+    """Предупредить, если видео сильно короче аудио (gdigrab упал в середине записи)."""
+    if not paths.video.exists() or not paths.mic_audio.exists():
+        return
+    try:
+        import subprocess, json as _json
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", str(paths.video)],
+            capture_output=True, text=True, timeout=10,
+        )
+        info = _json.loads(r.stdout) if r.returncode == 0 else {}
+        video_dur = float(info.get("format", {}).get("duration", 0))
+
+        r2 = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", str(paths.mic_audio)],
+            capture_output=True, text=True, timeout=10,
+        )
+        info2 = _json.loads(r2.stdout) if r2.returncode == 0 else {}
+        audio_dur = float(info2.get("format", {}).get("duration", 0))
+
+        if audio_dur > 0 and video_dur < audio_dur * 0.5:
+            logger.warning(
+                "ВНИМАНИЕ: видео (%.0f с) значительно короче аудио (%.0f с). "
+                "gdigrab завершился досрочно — скорее всего, Windows заблокировал "
+                "захват экрана (UAC, защищённый рабочий стол, DRM). "
+                "Для более надёжного захвата смените screen_grabber: ddagrab в config.yaml.",
+                video_dur, audio_dur,
+            )
+    except Exception as exc:
+        logger.debug("_check_video_length: %s", exc)
+
+
 def run_record(cfg: AppConfig) -> SessionPaths:
     """Запустить запись и вернуть SessionPaths."""
     paths = create_session(cfg.output_dir)
@@ -39,6 +73,9 @@ def run_record(cfg: AppConfig) -> SessionPaths:
         logger.info("Получен KeyboardInterrupt — останавливаю запись")
     finally:
         recorder.stop()
+
+    # Проверяем, что видео не обрезалось аварийно
+    _check_video_length(paths)
 
     # Сведение аудио
     logger.info("Свожу аудио: mic + system → mix")

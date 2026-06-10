@@ -98,13 +98,20 @@ def mix_audio_files(
         except ImportError:
             logger.warning("resampy не установлен — пропускаю ресемплинг")
 
-    # Привести к одинаковой длине
-    min_len = min(len(data_mic), len(data_sys))
-    if min_len == 0:
+    if len(data_mic) == 0 or len(data_sys) == 0:
         raise ValueError("Один из аудиофайлов пустой")
 
-    data_mic = data_mic[:min_len]
-    data_sys = data_sys[:min_len]
+    # Выравниваем по концу записи, а не по началу.
+    # soundcard стартует раньше ffmpeg (~2-5 с на инициализацию gdigrab/dshow),
+    # поэтому _system.wav длиннее — лишние кадры в начале, а не в конце.
+    # Обрезаем лишнее с начала более длинного файла.
+    len_diff = len(data_sys) - len(data_mic)
+    if len_diff > 0:
+        data_sys = data_sys[len_diff:]
+        logger.debug("Синхронизация аудио: обрезано %d кадров (%.2f с) с начала system", len_diff, len_diff / sr_sys)
+    elif len_diff < 0:
+        data_mic = data_mic[-len_diff:]
+        logger.debug("Синхронизация аудио: обрезано %d кадров (%.2f с) с начала mic", -len_diff, -len_diff / sr_mic)
 
     # Если моно — сделать 2D
     if data_mic.ndim == 1:
