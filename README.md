@@ -1,130 +1,211 @@
 # Meeting Recorder
 
-Запись экрана и звука, транскрипция с диаризацией, протокол и summary-отчёт.
+Screen and audio recorder with speaker diarization, transcription, meeting protocol and LLM-generated summary.  
+Controlled via CLI or a system tray icon.
 
-## Требования
+## Requirements
 
-- **ОС:** Windows 10/11 x64
+- **OS:** Windows 10/11 x64
 - **Python:** 3.11+
-- **ffmpeg:** должен быть в `PATH`
-- **GPU (опционально):** NVIDIA с CUDA для WhisperX и локальной LLM
+- **ffmpeg:** must be in `PATH`
+- **GPU (optional):** NVIDIA with CUDA for WhisperX and local LLM
 
-## Установка
+## Installation
 
 ```bash
-# 1. Создайте виртуальное окружение
+# 1. Create a virtual environment
 python -m venv .venv
 .venv\Scripts\activate
 
-# 2. Установите зависимости
-pip install -e ".[dev]"
+# 2. Install dependencies (including tray icon)
+pip install -e ".[tray]"
 
-# 3. Убедитесь, что ffmpeg в PATH
+# 3. Verify ffmpeg is in PATH
 ffmpeg -version
 ```
 
-## Настройка
+> For audio resampling when sample rates differ: `pip install -e ".[audio]"`
+
+## Configuration
 
 ```bash
-# Сгенерировать шаблон config.yaml
+# Generate a config template
 mrec generate-config
-
-# Или отредактировать вручную config.yaml
 ```
 
-Переопределение секретов через переменные окружения:
+Override secrets via environment variables:
 
 ```bash
-# Для диаризации (pyannote.audio)
-set HF_TOKEN=hf_xxxxxxxx
-
-# Для LLM (если backend=openrouter)
-set LLM_API_KEY=sk-or-vx-xxxx
+set HF_TOKEN=hf_xxxxxxxx       # HuggingFace token for diarization
+set LLM_API_KEY=sk-or-vx-xxxx  # LLM key (if backend=openrouter)
 ```
 
-## Использование
+Key `config.yaml` parameters:
+
+```yaml
+recording:
+  screen_grabber: "ddagrab"   # ddagrab (recommended) or gdigrab
+  mic_device: "Microphone name (dshow)"
+  record_system_audio: true
+
+llm:
+  backend: "local"            # local or openrouter
+  timeout: 600                # LLM request timeout in seconds
+  max_tokens: 16384
+```
+
+## Usage
+
+### System Tray (recommended)
+
+```bash
+mrec tray
+```
+
+The icon reflects the current state and shows elapsed time:
+
+| Color | State |
+|-------|-------|
+| Gray | Idle |
+| Red (blinking) | Recording |
+| Orange | Processing (transcription / report / mux) |
+| Purple | Error |
+
+Tray menu:
+
+| Item | Description |
+|------|-------------|
+| ▶ Start recording | Start screen and audio capture |
+| ⏹ Stop recording | Stop and run the full pipeline |
+| ⏹ Stop without processing | Stop and mix audio, skip transcription |
+| 💬 Chat about meeting | Open a terminal with `mrec chat` for the last session |
+| ⚙️ Transcribe + report | Process the last unprocessed session |
+| 📝 Regenerate report | Regenerate protocol and summary |
+| 🎬 Mux video + audio | Merge video and mix audio into a final MP4 |
+| 📂 Open meetings folder | Open the root folder of all sessions |
+| 📁 Open last session folder | Open the folder of the last (or current) session |
 
 ### CLI
 
 ```bash
-# Начать запись
+# Start recording
 mrec start
 
-# Остановить запись + автоматическая транскрипция и генерация отчёта
+# Stop recording + automatic transcription and report generation
 mrec stop
 
-# Повторная обработка существующей сессии
+# Stop recording without transcription (process later)
+mrec stop-only
+
+# Transcription + report for an existing session
 mrec process <session_id>
 
-# Только перегенерация summary
+# Regenerate protocol and summary only
 mrec report <session_id>
 
-# Список сессий
+# Merge mix audio with video into a final MP4
+mrec mux [session_id]
+
+# Interactive LLM chat about a meeting
+mrec chat [session_id]
+
+# List all sessions
 mrec list
+
+# Launch system tray mode
+mrec tray
 ```
 
-### Программный API
+All commands that accept `session_id` default to the last session when omitted.
+
+### Meeting Chat
+
+```bash
+mrec chat meeting_2026-06-10_09-46-18
+```
+
+Interactive REPL: loads the transcript, protocol and summary into the LLM context.
+Ask questions in a multi-turn dialogue — conversation history is kept for the duration of the chat session.
+Exit with `exit`, `quit`, or Ctrl+C.
+
+### Programmatic API
 
 ```python
 from meeting_recorder.config import load_config
 from meeting_recorder.pipeline import run_transcribe_only, run_report_only
-from meeting_recorder.naming import resolve_session
 
 cfg = load_config()
-
-# Транскрипция существующей сессии
-transcript = run_transcribe_only(cfg, "meeting_2026-06-05_14-30-12")
-
-# Генерация отчёта
-protocol, summary = run_report_only(cfg, "meeting_2026-06-05_14-30-12")
+transcript = run_transcribe_only(cfg, "meeting_2026-06-10_09-46-18")
+protocol, summary = run_report_only(cfg, "meeting_2026-06-10_09-46-18")
 ```
 
-## Архитектура
+## Session Artifacts
+
+Each session is stored in `output_dir/meeting_YYYY-MM-DD_HH-MM-SS/`:
+
+| File | Description |
+|------|-------------|
+| `*.mp4` | Screen recording (no audio) |
+| `*_mic.wav` | Microphone recording |
+| `*_system.wav` | System audio recording |
+| `*_mix.wav` | Mixed audio (mic + system, end-aligned) |
+| `*_final.mp4` | Final video with audio (after `mux`) |
+| `*_transcript.json` | Transcript with diarization |
+| `*_protocol.md` | Meeting protocol (Markdown) |
+| `*_summary.md` | LLM-generated summary report |
+| `*_ffmpeg.log` | ffmpeg log (for diagnostics) |
+
+## Architecture
 
 ```
 meeting_recorder/
-├── __main__.py          # CLI (click)
-├── config.py            # pydantic-конфиг (yaml)
-├── naming.py            # session_id, пути артефактов
-├── recorder.py          # ffmpeg: видео + 2 аудио-дорожки
-├── transcriber.py       # WhisperX: транскрипция + диаризация
-├── llm_client.py        # OpenAI-совместимый клиент
-├── report.py            # Протокол + summary
-├── pipeline.py          # Оркестрация
-├── prompts/             # Шаблоны для LLM
-└── ui/                  # PySide6 GUI (будет)
+├── __main__.py     # CLI (click): start, stop, stop-only, process,
+│                   #   report, mux, chat, tray, list, generate-config
+├── config.py       # pydantic config (yaml)
+├── naming.py       # session_id and artifact paths
+├── recorder.py     # ffmpeg: video + audio; mix_audio_files; mux_video
+├── transcriber.py  # WhisperX: transcription + diarization
+├── llm_client.py   # OpenAI-compatible HTTP client
+├── report.py       # Protocol + summary (chunking / map-reduce)
+├── pipeline.py     # Pipeline orchestration
+├── tray.py         # System tray icon (pystray + Pillow)
+└── prompts/        # LLM prompt templates
 ```
 
-## Пайплайн
+## Pipeline
 
 ```
-Запись (ffmpeg) → Транскрипция (WhisperX) → Протокол (Markdown) → Summary (LLM)
+Recording (ffmpeg + soundcard)
+  → mix_audio_files (end-aligned, averaged)
+  → Transcription (WhisperX + pyannote)
+  → Protocol (Markdown)
+  → Summary (LLM, map-reduce for long meetings)
+  → [optional] mux_video (final MP4)
 ```
 
-Каждый этап можно запустить независимо по `session_id`.
+Each stage can be run independently using a `session_id`.
 
-## Бэкенды LLM
+## LLM Backends
 
-| Параметр | local (llama-server) | openrouter |
-|----------|----------------------|------------|
+| Parameter | local (llama-server) | openrouter |
+|-----------|----------------------|------------|
 | `base_url` | `http://127.0.0.1:8080/v1` | `https://openrouter.ai/api/v1` |
-| `api_key` | (пустой) | ваш ключ OpenRouter |
-| `model` | ваша модель | напр. `meta-llama/llama-3.1-70b-instruct` |
+| `api_key` | (empty) | your OpenRouter key |
+| `model` | your model | e.g. `openai/gpt-oss-120b:free` |
+| `timeout` | 300–600 s | 60–120 s |
 
-## Локальный LLM
-
-Поднять llama-server:
+Start a local llama-server:
 
 ```bash
 llama-server -m your-model.gguf --host 127.0.0.1 --port 8080
 ```
 
-## Конфиденциальность
+## Privacy
 
-- `local` — все данные остаются на машине.
-- `openrouter` — транскрипт отправляется в облако OpenRouter. Приложение предупреждает об этом в логах.
+- `local` — all data (video, audio, transcript) stays on your machine.
+- `openrouter` — the transcript is sent to the OpenRouter cloud. The application warns about this in the logs.
 
-## Тесты
+## Tests
 
 ```bash
 pytest -v

@@ -71,7 +71,7 @@ class TrayApp:
         self._recorder: Optional[MeetingRecorder] = None
         self._paths: Optional[SessionPaths] = None
         self._icon = None          # pystray.Icon
-        self._rec_start: float = 0.0
+        self._op_start: float = 0.0   # время начала текущей операции
 
     # ------------------------------------------------------------------
     # Управление состоянием
@@ -83,17 +83,36 @@ class TrayApp:
             return self._state
 
     def _set_state(self, state: str, msg: str = "") -> None:
+        prev_state = self.state
         with self._lock:
             self._state = state
             self._status_msg = msg or _STATE_LABELS.get(state, state)
+            if state != "idle" and prev_state == "idle":
+                self._op_start = time.monotonic()
+            elif state == "idle":
+                self._op_start = 0.0
         self._refresh_icon(state)
+        # Запускаем тикер при переходе из idle в активное состояние
+        if prev_state == "idle" and state != "idle":
+            self._start_ticker()
 
     def _refresh_icon(self, state: str) -> None:
         if self._icon is None:
             return
         self._icon.icon = _make_icon(state)
-        self._icon.title = f"Meeting Recorder — {self._status_msg}"
+        self._icon.title = self._make_title()
         self._icon.menu = self._build_menu()
+
+    def _make_title(self) -> str:
+        elapsed = self._elapsed_str()
+        suffix = f"  {elapsed}" if elapsed else ""
+        return f"Meeting Recorder — {self._status_msg}{suffix}"
+
+    def _elapsed_str(self) -> str:
+        if not self._op_start:
+            return ""
+        sec = int(time.monotonic() - self._op_start)
+        return f"{sec // 60:02d}:{sec % 60:02d}"
 
     # ------------------------------------------------------------------
     # Меню
@@ -103,12 +122,9 @@ class TrayApp:
         import pystray
 
         state = self.state
-        dur = ""
-        if state == "recording" and self._rec_start:
-            sec = int(time.monotonic() - self._rec_start)
-            dur = f"  {sec // 60:02d}:{sec % 60:02d}"
-
-        status_label = f"  {self._status_msg}{dur}"
+        elapsed = self._elapsed_str()
+        suffix = f"  {elapsed}" if elapsed else ""
+        status_label = f"  {self._status_msg}{suffix}"
 
         return pystray.Menu(
             pystray.MenuItem(status_label, None, enabled=False),
@@ -154,6 +170,10 @@ class TrayApp:
                 "📂  Открыть папку встреч",
                 self._on_open_folder,
             ),
+            pystray.MenuItem(
+                "📁  Открыть папку последней встречи",
+                self._on_open_last_session_folder,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", self._on_exit),
         )
@@ -175,29 +195,26 @@ class TrayApp:
             with self._lock:
                 self._recorder = recorder
                 self._paths = paths
-                self._rec_start = time.monotonic()
             self._set_state("recording", f"Запись: {paths.session_id}")
-            self._start_recording_ticker()
         except Exception as exc:
             logger.error("Ошибка старта записи: %s", exc)
             self._set_state("error", str(exc)[:60])
             time.sleep(4)
             self._set_state("idle")
 
-    def _start_recording_ticker(self) -> None:
-        """Обновляем таймер и мигаем иконкой пока идёт запись."""
+    def _start_ticker(self) -> None:
+        """Единый тикер: мигает иконкой при записи, обновляет таймер для всех состояний."""
         def _tick():
             blink = False
-            while self.state == "recording":
-                self._icon.icon = _make_icon("recording", dim=blink)
-                self._icon.title = (
-                    f"Meeting Recorder — Запись "
-                    f"{int(time.monotonic() - self._rec_start) // 60:02d}:"
-                    f"{int(time.monotonic() - self._rec_start) % 60:02d}"
-                )
+            while self.state != "idle":
+                state = self.state
+                if self._icon:
+                    if state == "recording":
+                        self._icon.icon = _make_icon("recording", dim=blink)
+                    self._icon.title = self._make_title()
                 blink = not blink
-                time.sleep(0.8)
-        threading.Thread(target=_tick, daemon=True, name="tray-blink").start()
+                time.sleep(1.0)
+        threading.Thread(target=_tick, daemon=True, name="tray-ticker").start()
 
     def _on_stop(self, icon, item) -> None:
         if self.state != "recording":
@@ -453,6 +470,20 @@ class TrayApp:
             self._set_state("error", str(exc)[:60])
         time.sleep(4)
         self._set_state("idle")
+
+    def _on_open_last_session_folder(self, icon, item) -> None:
+        with self._lock:
+            paths = self._paths
+        if paths is None:
+            sessions = list_sessions(self.cfg.output_dir)
+            if sessions:
+                paths = sessions[-1]
+        if paths is None or not paths.dir.exists():
+            return
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(paths.dir)])
+        else:
+            subprocess.Popen(["xdg-open", str(paths.dir)])
 
     def _on_open_folder(self, icon, item) -> None:
         folder = Path(self.cfg.output_dir)
