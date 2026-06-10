@@ -41,10 +41,18 @@ class SystemAudioCapture:
         self._thread = threading.Thread(target=self._record, daemon=True, name="sys-audio")
         self._thread.start()
 
-    def stop(self) -> None:
+    def signal_stop(self) -> None:
+        """Сигнализировать о необходимости остановки без ожидания потока."""
         self._stop_event.set()
+
+    def wait(self, timeout: float = 10) -> None:
+        """Дождаться завершения потока записи."""
         if self._thread:
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=timeout)
+
+    def stop(self) -> None:
+        self.signal_stop()
+        self.wait()
 
     def _record(self) -> None:
         try:
@@ -184,13 +192,21 @@ class MeetingRecorder:
             logger.warning("Запись не идёт — stop вызван без start")
             return
 
-        # Отправляем 'q' для graceful stop
+        # Отправляем 'q' для graceful stop ffmpeg и одновременно сигнализируем
+        # soundcard-захвату, чтобы оба потока завершились в одно время.
+        # Важно: если сначала ждать ffmpeg.wait() и только потом останавливать
+        # soundcard, system_audio.wav будет длиннее на время flush-а ffmpeg
+        # (2-5 с), и mix_audio_files срежет эти секунды с начала system-трека,
+        # сдвигая его вперёд относительно mic.
         try:
             if self._process.stdin:
                 self._process.stdin.write(b"q")
                 self._process.stdin.flush()
         except Exception:
             pass
+
+        if self._sys_capture is not None:
+            self._sys_capture.signal_stop()
 
         try:
             self._process.wait(timeout=10)
@@ -207,9 +223,8 @@ class MeetingRecorder:
                 pass
             self._stderr_file = None
 
-        # Остановить soundcard-захват (ждём завершения записи в файл)
         if self._sys_capture is not None:
-            self._sys_capture.stop()
+            self._sys_capture.wait(timeout=10)
             if self._sys_capture.error:
                 logger.error("Системный звук не записан: %s", self._sys_capture.error)
             self._sys_capture = None
