@@ -192,7 +192,13 @@ def start(ctx):
     _STOP_FILE.unlink(missing_ok=True)
     _DONE_FILE.unlink(missing_ok=True)
 
-    recorder.start()
+    try:
+        recorder.start()
+    except Exception as exc:
+        logger.error("Ошибка запуска записи: %s", exc)
+        print(f"\n❌ Ошибка запуска записи: {exc}\n")
+        return
+
     ffmpeg_pid = recorder.ffmpeg_pid
 
     _save_state(paths.session_id, str(paths.video), ffmpeg_pid)

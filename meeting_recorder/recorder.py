@@ -182,9 +182,71 @@ class MeetingRecorder:
             stderr=self._stderr_file,
             **kwargs,
         )
+
+        # Проверяем успешность старта: ждём до 3 с, детектируем ранний выход ffmpeg
+        # или ошибку soundcard-захвата и прерываем запуск с понятным сообщением.
+        _POLL_STEP = 0.2
+        _STARTUP_TIMEOUT = 3.0
+        elapsed = 0.0
+        while elapsed < _STARTUP_TIMEOUT:
+            time.sleep(_POLL_STEP)
+            elapsed += _POLL_STEP
+            if self._process.poll() is not None:
+                self._fail_startup_ffmpeg()
+            if self._sys_capture is not None and self._sys_capture.error is not None:
+                self._fail_startup_sys_audio()
+
         self._recording = True
         self._start_time = time.monotonic()
         logger.info("Запись начата: %s", self.paths.session_id)
+
+    def _fail_startup_ffmpeg(self) -> None:
+        """Прервать запуск: ffmpeg завершился с ошибкой при инициализации устройств."""
+        exit_code = self._process.returncode
+        if self._sys_capture is not None:
+            self._sys_capture.signal_stop()
+            self._sys_capture = None
+        self._process = None
+        try:
+            self._stderr_file.flush()
+            self._stderr_file.close()
+        except Exception:
+            pass
+        self._stderr_file = None
+        try:
+            log_tail = self.paths.ffmpeg_log.read_text(encoding="utf-8", errors="replace")[-600:]
+        except Exception:
+            log_tail = ""
+        msg = f"ffmpeg завершился с кодом {exit_code} при старте — ошибка захвата видео или аудио"
+        logger.error("%s\n%s", msg, log_tail)
+        raise RuntimeError(msg)
+
+    def _fail_startup_sys_audio(self) -> None:
+        """Прервать запуск: ошибка захвата системного аудио (soundcard) при инициализации."""
+        err = self._sys_capture.error
+        self._sys_capture.signal_stop()
+        self._sys_capture = None
+        try:
+            if self._process and self._process.stdin:
+                self._process.stdin.write(b"q")
+                self._process.stdin.flush()
+        except Exception:
+            pass
+        try:
+            if self._process:
+                self._process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._process.terminate()
+            self._process.wait(timeout=3)
+        self._process = None
+        try:
+            self._stderr_file.close()
+        except Exception:
+            pass
+        self._stderr_file = None
+        msg = f"Ошибка захвата системного аудио: {err}"
+        logger.error(msg)
+        raise RuntimeError(msg)
 
     def stop(self) -> None:
         """Gracefully остановить запись (отправить 'q' во stdin)."""

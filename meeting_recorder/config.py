@@ -34,6 +34,11 @@ class TranscriptionConfig(BaseModel):
     language: str = "ru"
     diarization: bool = True
     device: Literal["cuda", "cpu"] = "cuda"
+    # beam_size=1 (greedy) в ~3-4x быстрее при минимальной потере точности
+    beam_size: int = Field(default=5, ge=1, le=10)
+    # batch_size=0 → авто: 16 на cuda, без батчинга на cpu
+    # BatchedInferencePipeline обрабатывает чанки параллельно (3-5x быстрее на GPU)
+    batch_size: int = Field(default=0, ge=0)
     hf_token: str = Field(default="")
     speaker_names: dict[str, str] = Field(default_factory=dict)
 

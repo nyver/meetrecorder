@@ -29,6 +29,7 @@ def _get_transcribe_model(model_name: str, device: str, dtype: str | None = None
         model_name,
         device=device,
         compute_type=dtype or ("float16" if device == "cuda" else "int8"),
+        num_workers=4,
         download_root=Path.home() / ".cache" / "whisper",
     )
     _model_cache[key] = model
@@ -254,29 +255,44 @@ def transcribe(
         except ImportError:
             device = "cpu"
 
+    # Автоматический batch_size: 16 на CUDA, 0 (без батчинга) на CPU
+    batch_size = tcfg.batch_size
+    if batch_size == 0 and device == "cuda":
+        batch_size = 16
+
     # Загрузка модели Whisper
     model = _get_transcribe_model(tcfg.model, device)
 
     logger.info(
-        "Начинаю транскрипцию: %s (language=%s, device=%s)",
-        audio_path.name, language, device,
+        "Начинаю транскрипцию: %s (model=%s, language=%s, device=%s, beam_size=%d, batch_size=%d)",
+        audio_path.name, tcfg.model, language, device, tcfg.beam_size, batch_size,
     )
 
-    # WhisperX: transcribe с word-level timing
-    segments_raw, info = model.transcribe(
-        str(audio_path),
-        beam_size=5,
+    transcribe_kwargs: dict = dict(
+        beam_size=tcfg.beam_size,
         language=language if language else None,
         vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-        ),
+        vad_parameters=dict(min_silence_duration_ms=500),
         initial_prompt=(
             "Это запись деловой встречи на русском языке."
             if language == "ru"
             else ""
         ),
     )
+
+    if batch_size > 0:
+        # BatchedInferencePipeline: параллельная обработка чанков — 3-5x быстрее на GPU
+        # без изменения качества (тот же алгоритм, тот же beam search)
+        from faster_whisper import BatchedInferencePipeline
+        pipeline = BatchedInferencePipeline(model=model)
+        logger.info("Используется BatchedInferencePipeline (batch_size=%d)", batch_size)
+        segments_raw, info = pipeline.transcribe(
+            str(audio_path),
+            batch_size=batch_size,
+            **transcribe_kwargs,
+        )
+    else:
+        segments_raw, info = model.transcribe(str(audio_path), **transcribe_kwargs)
 
     # Собираем сегменты
     segments: list[Segment] = []

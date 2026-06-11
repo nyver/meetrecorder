@@ -1,20 +1,84 @@
 output_dir: C:/Meetings
+
 recording:
   fps: 20
   video_codec: libx264
   audio_sample_rate: 48000
+
+  # Имя микрофона из списка dshow-устройств
+  # Узнать список: ffmpeg -list_devices true -f dshow -i dummy
   mic_device: Микрофон (Realtek Audio)
-  system_audio_device: virtual-audio-capturer
-  screen_grabber: ddagrab
+
+  # Захват системного аудио (то, что слышно в колонках/наушниках)
+  # soundcard — WASAPI loopback через Python, рекомендуется, не требует доп. драйверов
+  # wasapi   — через ffmpeg WASAPI (нужна сборка ffmpeg с поддержкой WASAPI)
+  # dshow    — через виртуальное устройство (Stereo Mix / VB-Cable)
+  system_audio_grabber: soundcard
+
+  # Имя виртуального устройства — используется только при system_audio_grabber: dshow
+  system_audio_device: Stereo Mix (Realtek High Definition Audio)
+
+  # false — записывать только микрофон (отключить захват системного звука)
+  record_system_audio: true
+
+  # ddagrab — аппаратный захват через DXGI (быстрее, требует ffmpeg с поддержкой DXGI)
+  # gdigrab — GDI-захват (совместимее, работает везде)
+  screen_grabber: gdigrab
+
 transcription:
-  model: large-v3
+  # Модели Whisper (faster-whisper):
+  #   large-v3       — максимальное качество
+  #   large-v3-turbo — 6-8x быстрее large-v3, разница по WER <2% для русского (рекомендуется)
+  #   medium         — компромисс для CPU без GPU
+  model: large-v3-turbo
+
   language: ru
   diarization: true
+
+  # cuda — использовать GPU (рекомендуется, значительно быстрее)
+  # cpu  — только процессор
   device: cuda
+
+  # Размер луча при декодировании (beam search)
+  # beam_size=1 (greedy) — в ~3-4x быстрее beam_size=5, потеря точности минимальна
+  # beam_size=5 — стандартное качество
+  beam_size: 1
+
+  # Размер батча для BatchedInferencePipeline (параллельная обработка чанков на GPU)
+  # 0    — авто: 16 на cuda, без батчинга на cpu
+  # 8-32 — задать вручную (больше = быстрее, но больше VRAM)
+  batch_size: 0
+
+  # Токен HuggingFace — нужен для диаризации (pyannote/speaker-diarization-3.1)
+  # Получить: https://huggingface.co/settings/tokens
+  # Можно задать через переменную окружения HF_TOKEN вместо прописывания здесь
+  # hf_token: hf_xxxxxxxxxxxxxxxxxxxx
+
+  # Имена участников встречи (SPEAKER_00, SPEAKER_01, ...)
+  # Порядок соответствует порядку первого появления говорящего
+  speaker_names:
+    SPEAKER_00: Иван
+    SPEAKER_01: Мария
+    SPEAKER_02: Алексей
+
 llm:
+  # local      — локальный llama.cpp сервер (llama-server)
+  # openrouter — облачный API через openrouter.ai
   backend: local
   base_url: http://127.0.0.1:8080/v1
+  # base_url: https://openrouter.ai/api/v1
+
+  # Псевдоним модели в llama-server или ID модели на OpenRouter
   model: qwen2.5-14b-instruct
+  # model: openai/gpt-4o-mini
+
+  # Ключ API — для OpenRouter обязателен, для локального сервера не нужен
+  # Можно задать через переменную окружения LLM_API_KEY
+  # api_key: sk-or-xxxxxxxxxxxxxxxxxxxx
+
   temperature: 0.3
-  max_tokens: 2048
+  max_tokens: 16384
+  # clean_protocol: true — убирать markdown-форматирование из протокола
   clean_protocol: false
+  # Таймаут запроса к LLM в секундах (увеличьте для длинных встреч)
+  timeout: 600
