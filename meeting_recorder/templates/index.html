@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}Meeting Recorder — Встречи{% endblock %}
+
+{% block header_extra %}
+  <span class="header-dir">{{ output_dir }}</span>
+{% endblock %}
+
+{% block content %}
+
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:22px">
+  <div>
+    <h1 style="font-size:1.4rem;font-weight:700;color:#0f172a">Встречи</h1>
+    <p style="color:#64748b;font-size:.85rem;margin-top:3px">
+      {{ sessions|length }} сессий · {{ output_dir }}
+    </p>
+  </div>
+</div>
+
+{% if not sessions %}
+
+<div class="empty-state card">
+  <div class="icon">📭</div>
+  <p>Сессий не найдено</p>
+  <p style="font-size:.82rem;margin-top:8px;color:#cbd5e1">
+    Запустите <code>mrec start</code> для записи первой встречи
+  </p>
+</div>
+
+{% else %}
+
+<div class="card" style="padding:0;overflow:hidden">
+  <table class="tbl">
+    <thead>
+      <tr>
+        <th>Дата / Время</th>
+        <th>Сессия</th>
+        <th>Длительность</th>
+        <th>Участники</th>
+        <th>Статус</th>
+        <th>Размер</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td>
+          <div class="dt-main">{{ s.date }}</div>
+          <div class="dt-sub">{{ s.time }}</div>
+        </td>
+        <td>
+          <a class="sid-link" href="/session/{{ s.session_id }}">{{ s.session_id }}</a>
+        </td>
+        <td class="muted">
+          {% if s.duration_min is not none %}{{ s.duration_min }} мин{% else %}—{% endif %}
+        </td>
+        <td class="muted" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          {% if s.speakers %}{{ s.speakers|join(", ") }}{% else %}—{% endif %}
+        </td>
+        <td>
+          <span class="badge {{ s.status_cls }}">{{ s.status }}</span>
+        </td>
+        <td class="muted">{{ s.size_mb }} МБ</td>
+        <td>
+          <a class="btn btn-primary btn-sm" href="/session/{{ s.session_id }}">Открыть</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% endif %}
+
+{% endblock %}

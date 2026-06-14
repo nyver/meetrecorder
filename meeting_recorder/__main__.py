@@ -710,6 +710,48 @@ def html_cmd(ctx, session_id: str | None):
     webbrowser.open(html_path.as_uri())
 
 
+@cli.command("serve")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Хост сервера")
+@click.option("--port", default=7070, show_default=True, type=int, help="Порт сервера")
+@click.option("--open/--no-open", "open_browser", default=True, help="Открыть браузер автоматически")
+@click.pass_context
+def serve_cmd(ctx, host: str, port: int, open_browser: bool):
+    """Запустить локальный веб-дашборд для просмотра встреч.
+
+    Открывает веб-интерфейс со списком сессий, медиаплеером,
+    транскриптом, протоколом и summary-отчётом.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        print("❌ uvicorn не установлен.")
+        print("   Установите: pip install \"meeting-recorder[web]\"")
+        sys.exit(1)
+
+    try:
+        from fastapi.templating import Jinja2Templates  # noqa: F401
+    except ImportError:
+        print("❌ FastAPI или Jinja2 не установлены.")
+        print("   Установите: pip install \"meeting-recorder[web]\"")
+        sys.exit(1)
+
+    cfg = ctx.obj["cfg"]
+    from meeting_recorder.dashboard import create_app
+
+    url = f"http://{host}:{port}"
+    print(f"\n🌐 Дашборд: {url}")
+    print(f"   Встречи:  {cfg.output_dir}")
+    print(f"   Остановить: Ctrl+C\n")
+
+    if open_browser:
+        import threading
+        import webbrowser
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+
+    app = create_app(cfg)
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
 @cli.command("generate-config")
 @click.option("--output", "-o", type=click.Path(), default="config.yaml", help="Путь для сохранения конфига")
 def generate_config_cmd(output: str):

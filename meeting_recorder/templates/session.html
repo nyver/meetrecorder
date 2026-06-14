@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+
+{% block title %}{{ meta.date }} {{ meta.time }} — Meeting Recorder{% endblock %}
+
+{% block header_extra %}
+  <a href="/" class="btn btn-ghost btn-sm" style="margin-left:auto">← К списку</a>
+{% endblock %}
+
+{% block content %}
+
+{# ---- Заголовок сессии ---- #}
+<div style="margin-bottom:22px">
+  <h1 style="font-size:1.35rem;font-weight:700;color:#0f172a">
+    Встреча {{ meta.date }}{% if meta.time %} в {{ meta.time }}{% endif %}
+  </h1>
+  <div style="display:flex;gap:14px;align-items:center;margin-top:8px;flex-wrap:wrap">
+    <span class="badge {{ meta.status_cls }}">{{ meta.status }}</span>
+    {% if meta.duration_min is not none %}
+      <span style="color:#64748b;font-size:.85rem">⏱ {{ meta.duration_min }} мин</span>
+    {% endif %}
+    {% if meta.speakers %}
+      <span style="color:#64748b;font-size:.85rem">👥 {{ meta.speakers|join(", ") }}</span>
+    {% endif %}
+    <span style="color:#94a3b8;font-size:.8rem">{{ meta.size_mb }} МБ</span>
+    <code style="color:#94a3b8;font-size:.73rem">{{ session_id }}</code>
+  </div>
+</div>
+
+{# ---- Медиаплеер ---- #}
+{% if media_url %}
+<div class="player-wrap">
+  {% if media_type == "video" %}
+  <video id="player" controls preload="metadata">
+    <source src="{{ media_url }}" type="video/mp4">
+    Ваш браузер не поддерживает видео.
+  </video>
+  {% else %}
+  <audio id="player" controls preload="metadata">
+    <source src="{{ media_url }}" type="audio/wav">
+    Ваш браузер не поддерживает аудио.
+  </audio>
+  {% endif %}
+</div>
+{% endif %}
+
+{# ---- Вкладки ---- #}
+{% set first = "summary" if summary_html else ("protocol" if protocol_html else "transcript") %}
+{% set has_any = summary_html or protocol_html or transcript %}
+
+{% if has_any %}
+<div class="tabs">
+  {% if summary_html %}
+  <button class="tab-btn {% if first == 'summary' %}active{% endif %}"
+          onclick="switchTab('summary', this)">📄 Summary</button>
+  {% endif %}
+  {% if protocol_html %}
+  <button class="tab-btn {% if first == 'protocol' %}active{% endif %}"
+          onclick="switchTab('protocol', this)">📋 Протокол</button>
+  {% endif %}
+  {% if transcript %}
+  <button class="tab-btn {% if first == 'transcript' %}active{% endif %}"
+          onclick="switchTab('transcript', this)">🗒 Транскрипт
+    <span style="font-size:.72rem;font-weight:400;color:#94a3b8;margin-left:4px">
+      ({{ transcript|length }})
+    </span>
+  </button>
+  {% endif %}
+</div>
+{% endif %}
+
+{# ---- Summary ---- #}
+{% if summary_html %}
+<div id="tab-summary" class="tab-panel {% if first == 'summary' %}active{% endif %} card md-content">
+  {{ summary_html|safe }}
+</div>
+{% endif %}
+
+{# ---- Протокол ---- #}
+{% if protocol_html %}
+<div id="tab-protocol" class="tab-panel {% if first == 'protocol' %}active{% endif %} card md-content">
+  {{ protocol_html|safe }}
+</div>
+{% endif %}
+
+{# ---- Транскрипт ---- #}
+{% if transcript %}
+<div id="tab-transcript" class="tab-panel {% if first == 'transcript' %}active{% endif %} card"
+     style="padding: 12px 16px">
+  <div class="transcript-list" id="tlist">
+    {% for seg in transcript %}
+    <div class="seg"
+         data-start="{{ seg.start }}"
+         data-end="{{ seg.end }}"
+         onclick="seek({{ seg.start }})">
+      <span class="ts">{{ seg.start|ts }}</span>
+      <span class="sp" style="color:{{ seg.color }}">{{ seg.speaker }}</span>
+      <span class="tx">{{ seg.text }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{# ---- Нет данных ---- #}
+{% if not has_any %}
+<div class="empty-state card">
+  <div class="icon">📭</div>
+  <p>Сессия ещё не обработана</p>
+  <p style="font-size:.83rem;margin-top:8px">
+    Запустите <code>mrec process {{ session_id }}</code> для транскрипции и генерации отчёта
+  </p>
+</div>
+{% endif %}
+
+{# ---- JavaScript ---- #}
+<script>
+function switchTab(id, btn) {
+  document.querySelectorAll('.tab-panel').forEach(function(p) {
+    p.classList.remove('active');
+  });
+  document.querySelectorAll('.tab-btn').forEach(function(b) {
+    b.classList.remove('active');
+  });
+  var panel = document.getElementById('tab-' + id);
+  if (panel) panel.classList.add('active');
+  if (btn) btn.classList.add('active');
+}
+
+function seek(t) {
+  var p = document.getElementById('player');
+  if (!p) return;
+  p.currentTime = t;
+  p.play();
+}
+
+{% if media_url and transcript %}
+(function () {
+  var player = document.getElementById('player');
+  if (!player) return;
+
+  var lastSeg = null;
+  var userScrolling = false;
+  var scrollTimer = null;
+
+  function pauseAutoScroll() {
+    userScrolling = true;
+    clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(function () { userScrolling = false; }, 3000);
+  }
+
+  window.addEventListener('wheel',     pauseAutoScroll, { passive: true });
+  window.addEventListener('touchmove', pauseAutoScroll, { passive: true });
+  window.addEventListener('keydown', function (e) {
+    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].indexOf(e.key) !== -1) {
+      pauseAutoScroll();
+    }
+  });
+
+  player.addEventListener('timeupdate', function () {
+    var t = player.currentTime;
+    var active = null;
+
+    document.querySelectorAll('.seg').forEach(function (el) {
+      var on = t >= parseFloat(el.dataset.start) && t < parseFloat(el.dataset.end);
+      el.classList.toggle('active', on);
+      if (on) active = el;
+    });
+
+    var transcriptPanel = document.getElementById('tab-transcript');
+    var panelVisible = transcriptPanel && transcriptPanel.classList.contains('active');
+
+    if (active && active !== lastSeg && !userScrolling && panelVisible) {
+      active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+    lastSeg = active;
+  });
+}());
+{% endif %}
+</script>
+
+{% endblock %}

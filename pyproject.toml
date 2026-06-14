@@ -40,6 +40,14 @@ audio = [
 tray = [
     "pystray>=0.19",
 ]
+web = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.27,<1",
+    "jinja2>=3.1,<4",
+]
+
+[tool.setuptools.package-data]
+meeting_recorder = ["templates/*.html", "prompts/*.md"]
 
 [project.scripts]
 mrec = "meeting_recorder.__main__:cli"
