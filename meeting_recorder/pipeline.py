@@ -11,6 +11,7 @@ from .config import AppConfig
 from .llm_client import LLMClientError
 from .naming import SessionPaths, create_session, list_sessions, resolve_session
 from .recorder import MeetingRecorder, mix_audio_files
+from .html_report import generate_html_protocol
 from .report import generate_protocol, generate_summary
 from .transcriber import transcribe
 
@@ -141,7 +142,29 @@ def run_report(
     protocol_path = generate_protocol(data, paths, cfg)
     summary_path = generate_summary(data, paths, cfg)
 
+    # HTML-протокол генерируется как необязательный шаг — ошибки не блокируют pipeline
+    try:
+        generate_html_protocol(data, paths, cfg)
+    except Exception as exc:
+        logger.warning("Не удалось сгенерировать HTML-протокол: %s", exc)
+
     return protocol_path, summary_path
+
+
+def run_html(
+    cfg: AppConfig,
+    session_id: str,
+) -> Path:
+    """Сгенерировать HTML-протокол для существующей сессии."""
+    paths = resolve_session(cfg.output_dir, session_id)
+
+    if not paths.transcript.exists():
+        raise PipelineError(
+            f"Транскрипт не найден: {paths.transcript}. Сначала выполните транскрипцию."
+        )
+
+    data = transcriber_load_transcript(paths.transcript)
+    return generate_html_protocol(data, paths, cfg)
 
 
 def run_pipeline(

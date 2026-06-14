@@ -22,7 +22,7 @@ import click
 
 from meeting_recorder.config import AppConfig, load_config
 from meeting_recorder.naming import list_sessions, resolve_session
-from meeting_recorder.pipeline import PipelineError, run_process, run_report_only, run_transcribe_only
+from meeting_recorder.pipeline import PipelineError, run_html, run_process, run_report_only, run_transcribe_only
 
 logger = logging.getLogger("meeting_recorder")
 
@@ -115,6 +115,17 @@ def cli(ctx, verbose, config_path):
     ctx.obj["config_path"] = config_path
 
     setup_logging(verbose)
+
+    _t0 = time.monotonic()
+
+    def _log_elapsed() -> None:
+        elapsed = time.monotonic() - _t0
+        mins, secs = divmod(int(elapsed), 60)
+        fmt = f"{mins} мин {secs} сек" if mins else f"{elapsed:.1f} сек"
+        logger.info("Время выполнения команды: %s", fmt)
+
+    ctx.call_on_close(_log_elapsed)
+
     try:
         cfg = load_config(config_path)
     except Exception as e:
@@ -666,6 +677,37 @@ def tray_cmd(ctx):
     cfg = ctx.obj["cfg"]
     from meeting_recorder.tray import TrayApp
     TrayApp(cfg).run()
+
+
+@cli.command("html")
+@click.argument("session_id", required=False, default=None)
+@click.pass_context
+def html_cmd(ctx, session_id: str | None):
+    """Сгенерировать HTML-протокол с кликабельными таймкодами и открыть в браузере.
+
+    SESSION_ID — идентификатор сессии (по умолчанию последняя с транскриптом).
+    """
+    import webbrowser
+
+    cfg = ctx.obj["cfg"]
+
+    if session_id is None:
+        sessions = list_sessions(cfg.output_dir)
+        candidates = [s for s in sessions if s.transcript.exists()]
+        if not candidates:
+            print(f"❌ Нет сессий с транскриптом в {cfg.output_dir}")
+            sys.exit(1)
+        session_id = candidates[-1].session_id
+        print(f"ℹ Используется последняя сессия с транскриптом: {session_id}")
+
+    try:
+        html_path = run_html(cfg, session_id)
+    except PipelineError as e:
+        print(f"❌ Ошибка: {e}")
+        sys.exit(1)
+
+    print(f"✅ HTML-протокол: {html_path}")
+    webbrowser.open(html_path.as_uri())
 
 
 @cli.command("generate-config")

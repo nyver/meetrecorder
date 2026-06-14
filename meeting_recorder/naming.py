@@ -54,6 +54,7 @@ class SessionPaths:
         self.transcript = self.dir / f"{session_id}_transcript.json"
         self.protocol = self.dir / f"{session_id}_protocol.md"
         self.summary = self.dir / f"{session_id}_summary.md"
+        self.html_protocol = self.dir / f"{session_id}_protocol.html"
 
     def ensure_dir(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)

@@ -176,6 +176,11 @@ class TrayApp:
                 enabled=(state == "idle"),
             ),
             pystray.MenuItem(
+                "🌐  HTML-протокол",
+                self._on_html_protocol,
+                enabled=(state == "idle"),
+            ),
+            pystray.MenuItem(
                 "📂  Открыть папку встреч",
                 self._on_open_folder,
             ),
@@ -476,6 +481,36 @@ class TrayApp:
             self._set_state("idle", "Mux завершён")
         except Exception as exc:
             logger.error("Ошибка mux: %s", exc)
+            self._set_state("error", str(exc)[:60])
+        time.sleep(_STATUS_DISPLAY_SECS)
+        self._set_state("idle")
+
+    def _on_html_protocol(self, icon, item) -> None:
+        if self.state != "idle":
+            return
+        threading.Thread(target=self._do_html_protocol, daemon=True, name="tray-html").start()
+
+    def _do_html_protocol(self) -> None:
+        import webbrowser
+        from .html_report import generate_html_protocol
+        from .transcriber import load_transcript
+
+        paths = self._pick_session(need_transcript=True)
+        if paths is None:
+            self._set_state("error", "Нет сессии с транскриптом для HTML")
+            time.sleep(_ERROR_BRIEF_SECS)
+            self._set_state("idle")
+            return
+
+        self._set_state("processing", f"HTML-протокол: {paths.session_id}…")
+        try:
+            data = load_transcript(paths.transcript)
+            html_path = generate_html_protocol(data, paths, self.cfg)
+            self._notify("Meeting Recorder", f"HTML готов: {html_path.name}")
+            self._set_state("idle", "HTML-протокол готов")
+            webbrowser.open(html_path.as_uri())
+        except Exception as exc:
+            logger.error("Ошибка HTML-протокола: %s", exc)
             self._set_state("error", str(exc)[:60])
         time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")
