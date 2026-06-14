@@ -45,6 +45,12 @@ _ERROR_BRIEF_SECS = 3      # кратковременная ошибка ("не�
 _EXIT_WAIT_SECS = 2        # ожидание остановки записи при выходе
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    """Форматировать секунды в читаемую строку: '1 мин 23 сек' или '4.7 сек'."""
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins} мин {secs} сек" if mins else f"{seconds:.1f} сек"
+
+
 def _make_icon(state: str, dim: bool = False) -> Image.Image:
     """Нарисовать круглую иконку 64×64 для заданного состояния."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -302,28 +308,34 @@ class TrayApp:
         self._set_state("idle")
 
     def _do_process(self, paths: SessionPaths) -> None:
+        t0 = time.monotonic()
         try:
             from .transcriber import transcribe
             from .report import generate_protocol, generate_summary
 
             self._set_state("processing", "Транскрипция…")
+            t_tr = time.monotonic()
             result = transcribe(paths.mix_audio, self.cfg, output_path=paths.transcript)
             result["session_id"] = paths.session_id
             paths.transcript.write_text(
                 json.dumps(result, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            logger.info("Транскрипция завершена за %s", _fmt_elapsed(time.monotonic() - t_tr))
 
             self._set_state("processing", "Генерирую отчёт…")
+            t_rep = time.monotonic()
             generate_protocol(result, paths, self.cfg)
             generate_summary(result, paths, self.cfg)
+            logger.info("Отчёт сгенерирован за %s", _fmt_elapsed(time.monotonic() - t_rep))
 
+            logger.info("Обработка завершена за %s: %s", _fmt_elapsed(time.monotonic() - t0), paths.session_id)
             self._notify("Meeting Recorder", f"Готово: {paths.session_id}")
             self._set_state("idle", "Готово")
             time.sleep(_STATUS_DISPLAY_SECS)
             self._set_state("idle")
         except Exception as exc:
-            logger.error("Ошибка обработки: %s", exc, exc_info=True)
+            logger.error("Ошибка обработки за %s: %s", _fmt_elapsed(time.monotonic() - t0), exc, exc_info=True)
             self._set_state("error", str(exc)[:60])
             time.sleep(_ERROR_LONG_SECS)
             self._set_state("idle")
@@ -402,6 +414,7 @@ class TrayApp:
             return
 
         self._set_state("processing", f"Отчёт: {paths.session_id}…")
+        t0 = time.monotonic()
         try:
             from .report import generate_protocol, generate_summary
             from .transcriber import load_transcript
@@ -409,10 +422,11 @@ class TrayApp:
             data = load_transcript(paths.transcript)
             generate_protocol(data, paths, self.cfg)
             generate_summary(data, paths, self.cfg)
+            logger.info("Отчёт сгенерирован за %s: %s", _fmt_elapsed(time.monotonic() - t0), paths.session_id)
             self._notify("Meeting Recorder", f"Отчёт готов: {paths.session_id}")
             self._set_state("idle", "Отчёт готов")
         except Exception as exc:
-            logger.error("Ошибка генерации отчёта: %s", exc)
+            logger.error("Ошибка генерации отчёта за %s: %s", _fmt_elapsed(time.monotonic() - t0), exc)
             self._set_state("error", str(exc)[:60])
         time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")
@@ -474,13 +488,15 @@ class TrayApp:
             return
 
         self._set_state("processing", f"Mux: {paths.session_id}…")
+        t0 = time.monotonic()
         try:
             out = mux_video(paths.video, paths.mix_audio, paths.final_video)
             size_mb = out.stat().st_size / 1024 / 1024
+            logger.info("Mux завершён за %s: %s (%.1f МБ)", _fmt_elapsed(time.monotonic() - t0), out.name, size_mb)
             self._notify("Meeting Recorder", f"Mux готов: {out.name} ({size_mb:.1f} МБ)")
             self._set_state("idle", "Mux завершён")
         except Exception as exc:
-            logger.error("Ошибка mux: %s", exc)
+            logger.error("Ошибка mux за %s: %s", _fmt_elapsed(time.monotonic() - t0), exc)
             self._set_state("error", str(exc)[:60])
         time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")
@@ -503,14 +519,16 @@ class TrayApp:
             return
 
         self._set_state("processing", f"HTML-протокол: {paths.session_id}…")
+        t0 = time.monotonic()
         try:
             data = load_transcript(paths.transcript)
             html_path = generate_html_protocol(data, paths, self.cfg)
+            logger.info("HTML-протокол готов за %s: %s", _fmt_elapsed(time.monotonic() - t0), html_path.name)
             self._notify("Meeting Recorder", f"HTML готов: {html_path.name}")
             self._set_state("idle", "HTML-протокол готов")
             webbrowser.open(html_path.as_uri())
         except Exception as exc:
-            logger.error("Ошибка HTML-протокола: %s", exc)
+            logger.error("Ошибка HTML-протокола за %s: %s", _fmt_elapsed(time.monotonic() - t0), exc)
             self._set_state("error", str(exc)[:60])
         time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")

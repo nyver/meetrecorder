@@ -17,6 +17,7 @@ from meeting_recorder.pipeline import (
     run_transcribe_only,
     run_report_only,
     run_process,
+    run_html,
     PipelineError,
 )
 
@@ -194,6 +195,51 @@ class TestRunReportOnly:
 # ---------------------------------------------------------------------------
 # run_process
 # ---------------------------------------------------------------------------
+
+class TestRunReportHtmlNonBlocking:
+    """HTML-генерация в run_report не должна блокировать pipeline при ошибке."""
+
+    def test_html_failure_does_not_raise(self, app_cfg, tmp_session):
+        _make_transcript(tmp_session.transcript, tmp_session.session_id)
+        with patch("meeting_recorder.pipeline.generate_protocol", return_value=tmp_session.protocol):
+            with patch("meeting_recorder.pipeline.generate_summary", return_value=tmp_session.summary):
+                with patch("meeting_recorder.pipeline.generate_html_protocol",
+                           side_effect=RuntimeError("html error")):
+                    proto, summ = run_report(app_cfg, tmp_session)
+        assert proto == tmp_session.protocol
+        assert summ == tmp_session.summary
+
+    def test_html_called_after_report(self, app_cfg, tmp_session):
+        _make_transcript(tmp_session.transcript, tmp_session.session_id)
+        with patch("meeting_recorder.pipeline.generate_protocol", return_value=tmp_session.protocol):
+            with patch("meeting_recorder.pipeline.generate_summary", return_value=tmp_session.summary):
+                with patch("meeting_recorder.pipeline.generate_html_protocol",
+                           return_value=tmp_session.html_protocol) as mock_html:
+                    run_report(app_cfg, tmp_session)
+        mock_html.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# run_html
+# ---------------------------------------------------------------------------
+
+class TestRunHtml:
+    def test_success(self, app_cfg, tmp_session):
+        _make_transcript(tmp_session.transcript, tmp_session.session_id)
+        with patch("meeting_recorder.pipeline.generate_html_protocol",
+                   return_value=tmp_session.html_protocol) as mock_html:
+            result = run_html(app_cfg, tmp_session.session_id)
+        mock_html.assert_called_once()
+        assert result == tmp_session.html_protocol
+
+    def test_missing_transcript_raises(self, app_cfg, tmp_session):
+        with pytest.raises(PipelineError, match="Транскрипт"):
+            run_html(app_cfg, tmp_session.session_id)
+
+    def test_nonexistent_session_raises(self, app_cfg):
+        with pytest.raises(FileNotFoundError):
+            run_html(app_cfg, "meeting_2000-01-01_00-00-00")
+
 
 class TestRunProcess:
     def test_runs_transcribe_and_report(self, app_cfg, tmp_session):

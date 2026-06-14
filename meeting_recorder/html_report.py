@@ -277,7 +277,7 @@ def _render(
     sp_buttons = "\n".join(
         f'<button class="sp-btn" '
         f'style="border-color:{colors[sp]};color:{colors[sp]}" '
-        f'data-sp={json.dumps(sp)} '
+        f'data-sp="{html.escape(sp)}" '
         f'onclick="toggleSp(this)">'
         f'{html.escape(sp)}</button>'
         for sp in unique_speakers
@@ -293,7 +293,7 @@ def _render(
         rows.append(
             f'<div class="seg" '
             f'data-start="{t_start:.2f}" data-end="{t_end:.2f}" '
-            f'data-sp={json.dumps(sp)} '
+            f'data-sp="{html.escape(sp)}" '
             f'onclick="seek({t_start:.2f})">'
             f'<span class="ts">{_format_timestamp(t_start)}</span>'
             f'<span class="sp" style="color:{color}">{html.escape(sp)}</span>'
@@ -302,7 +302,13 @@ def _render(
         )
     transcript_rows = "\n".join(rows)
 
-    speakers_json = json.dumps(unique_speakers)
+    # </> предотвращают преждевременное закрытие </script> в JS-блоке
+    speakers_json = (
+        json.dumps(unique_speakers)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
     duration_fmt  = _format_timestamp(duration_s)
 
     return _HTML_TEMPLATE.format(
