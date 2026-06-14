@@ -14,7 +14,6 @@ from meeting_recorder.report import (
     generate_summary,
     _format_timestamp,
     _clean_protocol,
-    _extract_transcript_text,
     _split_text_into_chunks,
     _map_reduce_summary,
     _call_llm_for_summary,
@@ -57,31 +56,17 @@ class TestSessionDatetime:
         assert dt.hour == 10
         assert dt.minute == 30
 
+    def test_suffixed_session_id(self):
+        dt = _session_datetime("meeting_2026-06-14_10-30-00_2")
+        assert dt.year == 2026
+        assert dt.month == 6
+        assert dt.hour == 10
+        assert dt.minute == 30
+
     def test_invalid_session_id_returns_now(self):
         from datetime import datetime
         dt = _session_datetime("invalid")
         assert isinstance(dt, datetime)
-
-
-# ---------------------------------------------------------------------------
-# _extract_transcript_text
-# ---------------------------------------------------------------------------
-
-class TestExtractTranscriptText:
-    def test_with_transcript_prefix(self):
-        text = "Header\n---\nТранскрипт: Привет мир"
-        result = _extract_transcript_text(text)
-        assert "Привет мир" in result
-
-    def test_with_dashes_fallback(self):
-        text = "Header\n---\nsome content here"
-        result = _extract_transcript_text(text)
-        assert "some content here" in result
-
-    def test_no_marker_returns_full(self):
-        text = "just some plain text"
-        result = _extract_transcript_text(text)
-        assert result == text
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +332,9 @@ class TestGenerateSummary:
 # ---------------------------------------------------------------------------
 
 class TestCallLLMForSummary:
+    _TEMPLATE = "Дата: {date} {time}\nДлит: {duration}\nУч: {speakers}\n\n{transcript_text}"
+    _META = {"date": "2026-06-05", "time": "14:30", "duration": "2", "speakers": "S0"}
+
     def test_short_text_direct_call(self, tmp_path):
         cfg = AppConfig()
         mock_client = MagicMock()
@@ -355,7 +343,9 @@ class TestCallLLMForSummary:
         mock_client.chat.return_value = "# Short summary"
 
         with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
-            result = _call_llm_for_summary("some text", est_tokens=100, cfg=cfg)
+            result = _call_llm_for_summary(
+                "some text", self._TEMPLATE, self._META, est_tokens=100, cfg=cfg
+            )
 
         assert result == "# Short summary"
         mock_client.chat.assert_called_once()
@@ -369,7 +359,9 @@ class TestCallLLMForSummary:
 
         with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
             with patch("meeting_recorder.report._map_reduce_summary", return_value="# MR") as mock_mr:
-                result = _call_llm_for_summary("text", est_tokens=200_000, cfg=cfg)
+                result = _call_llm_for_summary(
+                    "text", self._TEMPLATE, self._META, est_tokens=200_000, cfg=cfg
+                )
 
         mock_mr.assert_called_once()
         assert result == "# MR"
@@ -380,15 +372,19 @@ class TestCallLLMForSummary:
 # ---------------------------------------------------------------------------
 
 class TestMapReduceSummary:
+    _TEMPLATE = "Дата: {date} {time}\nДлит: {duration}\nУч: {speakers}\n\n{transcript_text}"
+    _META = {"date": "2026-06-05", "time": "14:30", "duration": "2", "speakers": "S0"}
+
     def test_basic_map_reduce(self, tmp_path):
         cfg = AppConfig()
         mock_client = MagicMock()
         mock_client.chat.return_value = "# Chunk result"
 
-        metadata = "Метаданные\n\nТранскрипт: Слово один.\n\nСлово два."
-
-        result = _map_reduce_summary(metadata, est_tokens=1000, cfg=cfg, client=mock_client)
-        assert "Chunk result" in result or result is not None
+        result = _map_reduce_summary(
+            "Слово один.\n\nСлово два.", self._TEMPLATE, self._META,
+            cfg=cfg, client=mock_client,
+        )
+        assert "Chunk result" in result
         assert mock_client.chat.call_count >= 1
 
     def test_all_empty_chunks_raises(self, tmp_path):
@@ -396,7 +392,36 @@ class TestMapReduceSummary:
         mock_client = MagicMock()
         mock_client.chat.return_value = ""
 
-        metadata = "Метаданные\n\nТранскрипт: Текст."
-
         with pytest.raises(RuntimeError, match="пустыми"):
-            _map_reduce_summary(metadata, est_tokens=1000, cfg=cfg, client=mock_client)
+            _map_reduce_summary(
+                "Текст.", self._TEMPLATE, self._META,
+                cfg=cfg, client=mock_client,
+            )
+
+    def test_chunks_receive_different_text(self, tmp_path):
+        """Каждый чанк должен получать свой фрагмент транскрипта, не полный текст."""
+        import meeting_recorder.report as report_mod
+
+        cfg = AppConfig()
+        received_prompts = []
+
+        def capture(msgs):
+            received_prompts.append(msgs[0]["content"])
+            return "# ok"
+
+        mock_client = MagicMock()
+        mock_client.chat.side_effect = capture
+
+        chunk_a = "A" * 100
+        chunk_b = "B" * 100
+        full_text = f"{chunk_a}\n\n{chunk_b}"
+
+        # Уменьшаем лимит контекста (150 слов → ~115 символов чанк) чтобы текст разбился на 2 чанка
+        with patch.object(report_mod, "_CONTEXT_TOKEN_LIMIT", 150):
+            _map_reduce_summary(full_text, self._TEMPLATE, self._META, cfg=cfg, client=mock_client)
+
+        # 2 map-промпта + 1 reduce = минимум 3 вызова
+        assert mock_client.chat.call_count >= 3
+        # Первый map-промпт содержит chunk_a, но не chunk_b
+        assert "A" * 10 in received_prompts[0]
+        assert "B" * 10 not in received_prompts[0]

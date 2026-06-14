@@ -21,10 +21,11 @@ _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 def _session_datetime(session_id: str) -> datetime:
-    """Разобрать дату/время из session_id формата meeting_YYYY-MM-DD_HH-MM-SS."""
+    """Разобрать дату/время из session_id формата meeting_YYYY-MM-DD_HH-MM-SS[_N]."""
     try:
-        # "meeting_2026-06-05_14-30-12" → "2026-06-05_14-30-12"
-        dt_str = session_id.split("_", 1)[1]
+        # "meeting_2026-06-05_14-30-12" или "meeting_2026-06-05_14-30-12_2"
+        parts = session_id.split("_")
+        dt_str = f"{parts[1]}_{parts[2]}"
         return datetime.strptime(dt_str, "%Y-%m-%d_%H-%M-%S")
     except Exception:
         return datetime.now()
@@ -156,31 +157,22 @@ def generate_summary(
 
     segments = data.get("segments", [])
     full_text = "\n".join(seg.get("text", "") for seg in segments)
-
-    # Оцениваем, поместится ли текст в контекстное окно
     est_tokens = len(full_text.split()) * _WORDS_PER_TOKEN
 
-    # Формируем метаданные
     meeting_dt = _session_datetime(paths.session_id)
-    date_str = meeting_dt.strftime("%Y-%m-%d")
-    time_str = meeting_dt.strftime("%H:%M")
     duration_min = data.get("duration_sec", 0) / 60.0
+    unique_speakers = sorted({seg.get("speaker", "UNKNOWN") for seg in segments})
 
-    unique_speakers = sorted({
-        seg.get("speaker", "UNKNOWN") for seg in segments
-    })
-    speakers_str = ", ".join(unique_speakers) if unique_speakers else "неизвестно"
-
+    # Метаданные передаём отдельным словарём — шаблон форматируется per-chunk в map-reduce
+    meta = {
+        "date": meeting_dt.strftime("%Y-%m-%d"),
+        "time": meeting_dt.strftime("%H:%M"),
+        "duration": f"{duration_min:.0f}",
+        "speakers": ", ".join(unique_speakers) if unique_speakers else "неизвестно",
+    }
     template = (_PROMPTS_DIR / "summary.md").read_text(encoding="utf-8")
-    metadata = template.format(
-        date=date_str,
-        time=time_str,
-        duration=f"{duration_min:.0f}",
-        speakers=speakers_str,
-        transcript_text=full_text,
-    )
 
-    summary_text = _call_llm_for_summary(metadata, est_tokens, cfg)
+    summary_text = _call_llm_for_summary(full_text, template, meta, est_tokens, cfg)
     if not summary_text or not summary_text.strip():
         raise RuntimeError("LLM вернул пустой ответ при генерации summary — проверьте настройки модели")
     paths.summary.write_text(summary_text, encoding="utf-8")
@@ -189,7 +181,9 @@ def generate_summary(
 
 
 def _call_llm_for_summary(
-    metadata: str,
+    full_text: str,
+    template: str,
+    meta: dict,
     est_tokens: int,
     cfg: AppConfig,
 ) -> str:
@@ -198,57 +192,34 @@ def _call_llm_for_summary(
 
     with create_llm_client(cfg.llm) as client:
         if est_tokens < _CONTEXT_TOKEN_LIMIT:
-            # Простой вызов — текст помещается
             logger.info("Транскрипт помещается в контекстное окно (%d токенов)", est_tokens)
-            return client.chat([
-                {"role": "user", "content": metadata},
-            ])
+            prompt = template.format(**meta, transcript_text=full_text)
+            return client.chat([{"role": "user", "content": prompt}])
         else:
-            # Chunking + map-reduce
             logger.info(
                 "Транскрипт превышает контекстное окно (%d > %d) — применяю chunking",
                 est_tokens, _CONTEXT_TOKEN_LIMIT,
             )
-            return _map_reduce_summary(metadata, est_tokens, cfg, client)
+            return _map_reduce_summary(full_text, template, meta, cfg, client)
 
 
 def _map_reduce_summary(
-    metadata: str,
-    est_tokens: int,
+    full_text: str,
+    template: str,
+    meta: dict,
     cfg: AppConfig,
-    client: LLMClient,
+    client: "LLMClient",
 ) -> str:
     """Map-reduce: разбить на чанки → промежуточные резюме → агрегация."""
-    # Определяем размер чанка
     chunk_size = int(_CONTEXT_TOKEN_LIMIT / _WORDS_PER_TOKEN)
+    chunks = _split_text_into_chunks(full_text, chunk_size)
 
-    # Разбиваем транскрипт на чанки по тексту
-    segments = []
-    for line in metadata.split("\n"):
-        if line.startswith("# Summary-отчёт") or line.startswith("---") or not line.strip():
-            continue
-        if "Транскрипт:" in line:
-            continue
-        if line.startswith("Транскрипт:"):
-            continue
-        segments.append(line)
-
-    # Извлекаем текст транскрипта из метаданных
-    transcript_text = _extract_transcript_text(metadata)
-    chunks = _split_text_into_chunks(transcript_text, chunk_size)
-
-    # Map: промежуточные резюме
+    # Map: каждый чанк форматируется своим промптом через тот же шаблон
     intermediate_summaries = []
-    template = _get_summary_template_without_transcript(cfg)
-
     for i, chunk in enumerate(chunks):
         logger.info("Map chunk %d/%d", i + 1, len(chunks))
-        chunk_metadata = metadata.replace(
-            "{transcript_text}", chunk
-        )
-        chunk_summary = client.chat([
-            {"role": "user", "content": chunk_metadata},
-        ])
+        prompt = template.format(**meta, transcript_text=chunk)
+        chunk_summary = client.chat([{"role": "user", "content": prompt}])
         if chunk_summary and chunk_summary.strip():
             intermediate_summaries.append(chunk_summary)
             logger.info("Chunk %d summary: %d chars", i + 1, len(chunk_summary))
@@ -261,15 +232,16 @@ def _map_reduce_summary(
     # Reduce: агрегация промежуточных резюме
     logger.info("Reduce: агрегация %d промежуточных резюме", len(intermediate_summaries))
     aggregated = "\n\n".join(intermediate_summaries)
+    meta_str = "\n".join(f"{k}: {v}" for k, v in meta.items())
 
-    reduce_template = textwrap.dedent("""\
+    reduce_prompt = textwrap.dedent("""\
     Ты — аналитик деловых встреч. Агрегируй промежуточные резюме частей встречи в единый summary-отчёт.
 
     ## Метаданные
-    {metadata}
+    {meta}
 
     ## Промежуточные резюме
-    {intermediate_summaries}
+    {summaries}
 
     ## Требования
     Сгенерируй единый markdown-отчёт той же структуры:
@@ -280,31 +252,9 @@ def _map_reduce_summary(
     - Открытые вопросы
 
     Возвращай ТОЛЬКО markdown, без комментариев.
-    """)
+    """).format(meta=meta_str, summaries=aggregated)
 
-    reduce_prompt = reduce_template.format(
-        metadata=template,
-        intermediate_summaries=aggregated,
-    )
-    return client.chat([
-        {"role": "user", "content": reduce_prompt},
-    ])
-
-
-def _extract_transcript_text(metadata: str) -> str:
-    """Извлечь текст транскрипта из метаданных."""
-    # Ищем текст после строки "Транскрипт:" или "transcript_text:"
-    for prefix in ("Транскрипт:", "transcript_text="):
-        idx = metadata.find(prefix)
-        if idx != -1:
-            return metadata[idx + len(prefix):].strip()
-
-    # fallback — берём всё, что после "---"
-    idx = metadata.find("---")
-    if idx != -1:
-        return metadata[idx + 3:].strip()
-
-    return metadata
+    return client.chat([{"role": "user", "content": reduce_prompt}])
 
 
 def _split_text_into_chunks(text: str, max_chars: int) -> list[str]:
@@ -327,12 +277,3 @@ def _split_text_into_chunks(text: str, max_chars: int) -> list[str]:
         chunks.append("\n\n".join(current))
 
     return chunks
-
-
-def _get_summary_template_without_transcript(cfg: AppConfig) -> str:
-    """Вернуть шаблон summary без вставки транскрипта (для reduce)."""
-    template_path = _PROMPTS_DIR / "summary.md"
-    text = template_path.read_text(encoding="utf-8")
-    # Убираем блок с транскриптом
-    text = text.replace("{transcript_text}", "")
-    return text

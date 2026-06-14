@@ -178,17 +178,25 @@ class MeetingRecorder:
         logger.info("Начинаю запись (ffmpeg cmd: %s ...)", " ".join(cmd[:4]))
 
         self._stderr_file = open(str(self.paths.ffmpeg_log), "wb")
-        kwargs: dict = {}
-        if sys.platform == "win32":
-            # Отдельная process group нужна для CTRL_BREAK_EVENT при graceful stop
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        self._process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=self._stderr_file,
-            **kwargs,
-        )
+        try:
+            kwargs: dict = {}
+            if sys.platform == "win32":
+                # Отдельная process group нужна для CTRL_BREAK_EVENT при graceful stop
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            self._process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr_file,
+                **kwargs,
+            )
+        except Exception:
+            self._stderr_file.close()
+            self._stderr_file = None
+            if self._sys_capture is not None:
+                self._sys_capture.signal_stop()
+                self._sys_capture = None
+            raise
 
         # Проверяем успешность старта: ждём до _FFMPEG_STARTUP_TIMEOUT с, детектируем ранний
         # выход ffmpeg или ошибку soundcard-захвата и прерываем запуск с понятным сообщением.

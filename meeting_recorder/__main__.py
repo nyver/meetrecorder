@@ -27,17 +27,29 @@ from meeting_recorder.pipeline import PipelineError, run_process, run_report_onl
 logger = logging.getLogger("meeting_recorder")
 
 # ---------------------------------------------------------------------------
-# Состояние записи (пersistence на диск)
+# Состояние записи (persistence на диск)
 # ---------------------------------------------------------------------------
 
-_STATE_DIR = Path(__file__).parent / ".state"
+
+def _default_state_dir() -> Path:
+    """Вернуть user-writable директорию для файлов состояния."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    else:
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "MeetingRecorder" / ".state"
+
+
+_STATE_DIR = _default_state_dir()
 _STATE_FILE = _STATE_DIR / "active_session.json"
 _STOP_FILE = _STATE_DIR / "stop_requested"
 _DONE_FILE = _STATE_DIR / "recording_done"
 
 
 def _ensure_state_dir() -> None:
-    _STATE_DIR.mkdir(exist_ok=True)
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _save_state(session_id: str, video_path: str, ffmpeg_pid: int | None = None) -> None:
@@ -435,8 +447,9 @@ def _build_chat_system_prompt(paths, cfg) -> str:
 
     session_id = paths.session_id
     try:
-        dt_str = session_id.split("_", 1)[1]
-        meeting_dt = datetime.strptime(dt_str, "%Y-%m-%d_%H-%M-%S")
+        # Поддержка суффиксных ID: meeting_YYYY-MM-DD_HH-MM-SS[_N]
+        parts = session_id.split("_")
+        meeting_dt = datetime.strptime(f"{parts[1]}_{parts[2]}", "%Y-%m-%d_%H-%M-%S")
         date_str = meeting_dt.strftime("%Y-%m-%d")
         time_str = meeting_dt.strftime("%H:%M")
     except Exception:

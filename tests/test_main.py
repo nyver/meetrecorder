@@ -86,7 +86,7 @@ class TestStateHelpers:
         assert _load_state() is None
 
     def test_load_corrupted_returns_none(self):
-        _STATE_FILE.parent.mkdir(exist_ok=True)
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _STATE_FILE.write_text("not-json", encoding="utf-8")
         assert _load_state() is None
 
@@ -167,7 +167,7 @@ class TestLoadActiveSession:
         assert paths is not None
 
     def test_corrupted_session_id(self, mock_cfg):
-        _STATE_FILE.parent.mkdir(exist_ok=True)
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _STATE_FILE.write_text(json.dumps({"session_id": None}), encoding="utf-8")
         sid, pid, paths = _load_active_session(mock_cfg)
         assert sid is None

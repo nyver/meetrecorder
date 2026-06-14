@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -12,15 +13,17 @@ from .naming import SessionPaths
 
 logger = logging.getLogger(__name__)
 
-# Кэш для моделей (singleton)
+# Кэш для моделей (singleton) + lock для thread-safety
 _model_cache: dict[str, Any] = {}
+_model_cache_lock = threading.Lock()
 
 
 def _get_transcribe_model(model_name: str, device: str, dtype: str | None = None):
-    """Загрузить Whisper-модель с кэшированием."""
+    """Загрузить Whisper-модель с кэшированием (thread-safe)."""
     key = f"{model_name}_{device}_{dtype}"
-    if key in _model_cache:
-        return _model_cache[key]
+    with _model_cache_lock:
+        if key in _model_cache:
+            return _model_cache[key]
 
     from faster_whisper import WhisperModel
 
@@ -32,9 +35,13 @@ def _get_transcribe_model(model_name: str, device: str, dtype: str | None = None
         num_workers=4,
         download_root=Path.home() / ".cache" / "whisper",
     )
-    _model_cache[key] = model
     logger.info("Модель Whisper загружена")
-    return model
+
+    with _model_cache_lock:
+        # Двойная проверка: другой поток мог загрузить модель пока мы ждали
+        if key not in _model_cache:
+            _model_cache[key] = model
+        return _model_cache[key]
 
 
 def _patch_torchaudio_compat() -> None:
@@ -168,10 +175,11 @@ def _patch_speechbrain_lazy_module() -> None:
 
 
 def _get_diarization_model(cfg: AppConfig):
-    """Загрузить pyannote.audio диаризацию с кэшированием."""
+    """Загрузить pyannote.audio диаризацию с кэшированием (thread-safe)."""
     key = "diarization"
-    if key in _model_cache:
-        return _model_cache[key]
+    with _model_cache_lock:
+        if key in _model_cache:
+            return _model_cache[key]
 
     try:
         _patch_torchaudio_compat()
@@ -201,7 +209,9 @@ def _get_diarization_model(cfg: AppConfig):
         pipeline.to(torch.device(cfg.transcription.device))
     except Exception as e:
         logger.warning("Не удалось перенести pyannote на %s: %s", cfg.transcription.device, e)
-    _model_cache[key] = pipeline
+    with _model_cache_lock:
+        if key not in _model_cache:
+            _model_cache[key] = pipeline
     logger.info("pyannote.pipeline загружена")
     return pipeline
 
@@ -365,21 +375,20 @@ def _apply_diarization(
     # pyannote 3.x: передаём путь напрямую
     diarization = pipeline(str(audio_path))
 
-    # Создаем карту: segment_index → set of speakers
-    speaker_map: dict[int, set[str]] = {i: set() for i in range(len(segments))}
+    # Карта: segment_index → {speaker: суммарное перекрытие в секундах}
+    speaker_map: dict[int, dict[str, float]] = {i: {} for i in range(len(segments))}
 
-    # Пробегаем по активным диапазонам диаризации
     for turn, _, speaker in diarization.itertracks(yield_label=True):
-        start, end = turn.start, turn.end
-        # Находим сегменты, перекрывающиеся с этим интервалом
+        t_start, t_end = turn.start, turn.end
         for i, seg in enumerate(segments):
-            if seg.start < end and seg.end > start:
-                speaker_map[i].add(speaker)
+            overlap = min(seg.end, t_end) - max(seg.start, t_start)
+            if overlap > 0:
+                speaker_map[i][speaker] = speaker_map[i].get(speaker, 0.0) + overlap
 
-    # Заменяем speaker на первый найденный (или UNKNOWN)
+    # Назначаем говорящего с максимальным перекрытием (детерминированно)
     for i, seg in enumerate(segments):
-        speakers = speaker_map.get(i, set())
-        seg.speaker = speakers.pop() if speakers else "UNKNOWN"
+        overlaps = speaker_map.get(i, {})
+        seg.speaker = max(overlaps, key=overlaps.__getitem__) if overlaps else "UNKNOWN"
 
     # Нормализуем имена говорящих (SPEAKER_00, SPEAKER_01, …)
     unique_speakers = sorted({s.speaker for s in segments if s.speaker != "UNKNOWN"})

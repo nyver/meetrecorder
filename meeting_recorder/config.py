@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -87,7 +88,21 @@ class AppConfig(BaseModel):
 # Функции загрузки
 # ---------------------------------------------------------------------------
 
-_CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.yaml"
+def _default_config_path() -> Path:
+    # Editable/dev install: config.yaml рядом с корнем проекта — используем его
+    legacy = Path(__file__).resolve().parent.parent / "config.yaml"
+    if legacy.exists():
+        return legacy
+    # Стандартное расположение для установленного пакета
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "MeetingRecorder" / "config.yaml"
+
+
+_CONFIG_FILE = _default_config_path()
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:

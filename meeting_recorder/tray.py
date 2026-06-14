@@ -90,8 +90,8 @@ class TrayApp:
             return self._state
 
     def _set_state(self, state: str, msg: str = "") -> None:
-        prev_state = self.state
         with self._lock:
+            prev_state = self._state  # читаем внутри того же lock-а — нет TOCTOU
             self._state = state
             self._status_msg = msg or _STATE_LABELS.get(state, state)
             if state != "idle" and prev_state == "idle":
@@ -504,8 +504,10 @@ class TrayApp:
 
     def _on_exit(self, icon, item) -> None:
         if self.state == "recording":
-            threading.Thread(target=self._do_stop, daemon=True).start()
-            time.sleep(_EXIT_WAIT_SECS)
+            # Не-daemon тред: дожидаемся штатного завершения ffmpeg до выхода
+            t = threading.Thread(target=self._do_stop, daemon=False, name="tray-exit-stop")
+            t.start()
+            t.join(timeout=30)  # recorder.stop() может занимать до ~25 сек
         icon.stop()
 
     # ------------------------------------------------------------------
