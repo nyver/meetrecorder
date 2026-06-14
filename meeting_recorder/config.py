@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 # ---------------------------------------------------------------------------
 # Pydantic-модели
@@ -39,16 +39,16 @@ class TranscriptionConfig(BaseModel):
     # batch_size=0 → авто: 16 на cuda, без батчинга на cpu
     # BatchedInferencePipeline обрабатывает чанки параллельно (3-5x быстрее на GPU)
     batch_size: int = Field(default=0, ge=0)
-    hf_token: str = Field(default="")
+    hf_token: SecretStr = Field(default=SecretStr(""))
     speaker_names: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _resolve_hf_token(self) -> "TranscriptionConfig":
-        if self.hf_token:
+        if self.hf_token.get_secret_value():
             return self
         env = os.environ.get("HF_TOKEN", "").strip()
         if env:
-            self.hf_token = env
+            self.hf_token = SecretStr(env)
         return self
 
 
@@ -57,7 +57,7 @@ class LLMConfig(BaseModel):
 
     backend: Literal["local", "openrouter"] = "local"
     base_url: str = "http://127.0.0.1:8080/v1"
-    api_key: str = Field(default="")
+    api_key: SecretStr = Field(default=SecretStr(""))
     model: str = "qwen2.5-14b-instruct"
     temperature: float = Field(default=0.3, ge=0, le=2)
     max_tokens: int = Field(default=16384, gt=0)
@@ -66,11 +66,11 @@ class LLMConfig(BaseModel):
 
     @model_validator(mode="after")
     def _resolve_api_key(self) -> "LLMConfig":
-        if self.api_key:
+        if self.api_key.get_secret_value():
             return self
         env = os.environ.get("LLM_API_KEY", "").strip()
         if env:
-            self.api_key = env
+            self.api_key = SecretStr(env)
         return self
 
 
@@ -101,21 +101,28 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     return AppConfig.model_validate(raw)
 
 
+def _reveal_secrets(d: dict) -> dict:
+    """Рекурсивно преобразовать SecretStr в строки для сериализации в YAML."""
+    result = {}
+    for k, v in d.items():
+        if isinstance(v, SecretStr):
+            val = v.get_secret_value()
+            if val:
+                result[k] = val
+        elif isinstance(v, dict):
+            filtered = _reveal_secrets(v)
+            if filtered:
+                result[k] = filtered
+        elif v not in ("", [], None):
+            result[k] = v
+    return result
+
+
 def save_config(cfg: AppConfig, path: Path | str | None = None) -> None:
     """Сохранить конфиг в YAML-файл."""
     config_path = Path(path) if path else _CONFIG_FILE
-    # Используем exclude_none=True и дополнительно исключаем пустые строки
     raw = cfg.model_dump(exclude_none=True)
-    # Убираем пустые строки и пустые словари
-    data = {}
-    for section, values in raw.items():
-        if isinstance(values, dict):
-            filtered = {k: v for k, v in values.items()
-                        if v not in ("", {}, [], None)}
-            if filtered:
-                data[section] = filtered
-        else:
-            data[section] = values
+    data = _reveal_secrets(raw)
     config_path.write_text(
         yaml.dump(
             data,

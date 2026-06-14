@@ -23,8 +23,9 @@ class LLMClient:
     def __init__(self, config: LLMConfig):
         self.config = config
         headers = {"Content-Type": "application/json"}
-        if config.api_key:
-            headers["Authorization"] = f"Bearer {config.api_key}"
+        api_key = config.api_key.get_secret_value()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.Client(
             timeout=httpx.Timeout(config.timeout, connect=10.0),
             headers=headers,

@@ -17,7 +17,7 @@ class TestAppConfig:
         cfg = AppConfig()
         assert cfg.output_dir == "C:/Meetings"
         assert cfg.recording.fps == 20
-        assert cfg.recording.screen_grabber == "ddagrab"
+        assert cfg.recording.screen_grabber == "gdigrab"
         assert cfg.transcription.model == "large-v3"
         assert cfg.transcription.language == "ru"
         assert cfg.transcription.device == "cuda"
@@ -47,9 +47,16 @@ class TestTranscriptionConfig:
         try:
             raw = {"model": "medium", "language": "en"}
             cfg = TranscriptionConfig.model_validate(raw)
-            assert cfg.hf_token == "test_hf_token_123"
+            assert cfg.hf_token.get_secret_value() == "test_hf_token_123"
         finally:
             os.environ.pop("HF_TOKEN", None)
+
+    def test_hf_token_not_logged(self):
+        """SecretStr не должен раскрываться в repr."""
+        from pydantic import SecretStr
+        cfg = TranscriptionConfig(hf_token=SecretStr("super-secret"))
+        assert "super-secret" not in repr(cfg)
+        assert "**********" in repr(cfg)
 
 
 class TestLLMConfig:
@@ -58,9 +65,16 @@ class TestLLMConfig:
         try:
             raw = {"backend": "openrouter", "base_url": "https://openrouter.ai/api/v1"}
             cfg = LLMConfig.model_validate(raw)
-            assert cfg.api_key == "sk-or-test-key"
+            assert cfg.api_key.get_secret_value() == "sk-or-test-key"
         finally:
             os.environ.pop("LLM_API_KEY", None)
+
+    def test_api_key_not_logged(self):
+        """SecretStr не должен раскрываться в repr."""
+        from pydantic import SecretStr
+        cfg = LLMConfig(api_key=SecretStr("sk-or-secret"))
+        assert "sk-or-secret" not in repr(cfg)
+        assert "**********" in repr(cfg)
 
 
 class TestLoadConfig:

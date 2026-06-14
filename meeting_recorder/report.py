@@ -118,6 +118,10 @@ def _clean_protocol(protocol_text: str, cfg: AppConfig) -> str:
             {"role": "user", "content": prompt},
         ])
 
+    if not cleaned or not cleaned.strip():
+        logger.warning("LLM вернул пустой ответ при чистке протокола — используется оригинал")
+        return protocol_text
+
     # Убираем возможные маркеры markdown-кода, если LLM их добавил
     cleaned = cleaned.strip()
     if cleaned.startswith("```"):
@@ -177,6 +181,8 @@ def generate_summary(
     )
 
     summary_text = _call_llm_for_summary(metadata, est_tokens, cfg)
+    if not summary_text or not summary_text.strip():
+        raise RuntimeError("LLM вернул пустой ответ при генерации summary — проверьте настройки модели")
     paths.summary.write_text(summary_text, encoding="utf-8")
     logger.info("Summary-отчёт сохранён: %s", paths.summary)
     return paths.summary
@@ -243,8 +249,14 @@ def _map_reduce_summary(
         chunk_summary = client.chat([
             {"role": "user", "content": chunk_metadata},
         ])
-        intermediate_summaries.append(chunk_summary)
-        logger.info("Chunk %d summary: %d chars", i + 1, len(chunk_summary))
+        if chunk_summary and chunk_summary.strip():
+            intermediate_summaries.append(chunk_summary)
+            logger.info("Chunk %d summary: %d chars", i + 1, len(chunk_summary))
+        else:
+            logger.warning("Chunk %d: LLM вернул пустой ответ, пропускаю", i + 1)
+
+    if not intermediate_summaries:
+        raise RuntimeError("Все промежуточные резюме оказались пустыми — LLM не вернул результат")
 
     # Reduce: агрегация промежуточных резюме
     logger.info("Reduce: агрегация %d промежуточных резюме", len(intermediate_summaries))

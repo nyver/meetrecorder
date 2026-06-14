@@ -115,6 +115,10 @@ def _patch_torch_load_compat() -> None:
 
     Патчим torch.load глобально: устанавливаем weights_only=False по умолчанию.
     pl_load в pyannote — прямая ссылка, поэтому патчить cloud_io бесполезно.
+
+    БЕЗОПАСНОСТЬ: weights_only=False допускает выполнение произвольного кода при загрузке
+    недоверенных checkpoint-файлов. Допустимо только для моделей из доверенных источников
+    (HuggingFace + официальные репозитории pyannote).
     """
     try:
         import torch
@@ -179,7 +183,7 @@ def _get_diarization_model(cfg: AppConfig):
         logger.warning("pyannote.audio недоступна — диаризация отключена: %s", e)
         return None
 
-    hf_token = cfg.transcription.hf_token
+    hf_token = cfg.transcription.hf_token.get_secret_value()
     if not hf_token:
         logger.warning(
             "HF_TOKEN не указан — диаризация будет отключена. "
@@ -307,12 +311,14 @@ def transcribe(
     logger.info("Whisper: %d сегментов (язык: %s)", len(segments), info.language)
 
     # Диаризация
+    diarization_applied = False
     if tcfg.diarization:
         pipeline = _get_diarization_model(cfg)
         if pipeline is not None:
             segments = _apply_diarization(pipeline, audio_path, segments, cfg)
+            diarization_applied = True
         else:
-            logger.warning("Диаризация пропущена")
+            logger.warning("Диаризация пропущена — HF_TOKEN не задан или pyannote недоступна")
     else:
         logger.info("Диаризация отключена в конфиге")
 
@@ -328,6 +334,7 @@ def transcribe(
         "session_id": "",  # будет заполнено вызывающим
         "language": detected_lang,
         "duration_sec": round(duration, 2),
+        "diarization_enabled": diarization_applied,
         "segments": [s.to_dict() for s in segments],
     }
 

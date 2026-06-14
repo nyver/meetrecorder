@@ -18,6 +18,13 @@ from .naming import SessionPaths
 
 logger = logging.getLogger(__name__)
 
+# Таймауты для управления ffmpeg-процессом
+_FFMPEG_GRACEFUL_STOP_TIMEOUT = 10  # секунд ждать graceful stop перед force-kill
+_FFMPEG_FORCE_KILL_TIMEOUT = 5      # секунд ждать после terminate()
+_FFMPEG_STARTUP_TIMEOUT = 3.0       # секунд ждать инициализацию устройств при старте
+_FFMPEG_STARTUP_POLL = 0.2          # интервал опроса во время ожидания старта
+_SYS_AUDIO_JOIN_TIMEOUT = 10        # секунд ждать завершения потока soundcard
+
 
 # ---------------------------------------------------------------------------
 # Захват системного аудио через WASAPI loopback (soundcard)
@@ -27,11 +34,12 @@ logger = logging.getLogger(__name__)
 class SystemAudioCapture:
     """Запись системного аудио (WASAPI loopback) в отдельном потоке."""
 
-    CHUNK_FRAMES = 4800  # 100 мс при 48 кГц
+    _CHUNK_MS = 100  # длина чанка в миллисекундах
 
     def __init__(self, output_path: Path, sample_rate: int = 48000):
         self._path = output_path
         self._sr = sample_rate
+        self._chunk_frames = sample_rate * self._CHUNK_MS // 1000
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.error: Optional[Exception] = None
@@ -63,9 +71,9 @@ class SystemAudioCapture:
             logger.info("Захват системного аудио: %s", speaker.name)
 
             chunks: list[np.ndarray] = []
-            with loopback.recorder(samplerate=self._sr, channels=1, blocksize=self.CHUNK_FRAMES) as rec:
+            with loopback.recorder(samplerate=self._sr, channels=1, blocksize=self._chunk_frames) as rec:
                 while not self._stop_event.is_set():
-                    chunk = rec.record(numframes=self.CHUNK_FRAMES)
+                    chunk = rec.record(numframes=self._chunk_frames)
                     chunks.append(chunk)
 
             if chunks:
@@ -150,7 +158,6 @@ class MeetingRecorder:
         self._stderr_file = None
         self._recording = False
         self._start_time: Optional[float] = None
-        self._stop_callback: Optional[callable] = None
         self._sys_capture: Optional[SystemAudioCapture] = None
 
     # -- публичные методы --------------------------------------------------
@@ -183,14 +190,12 @@ class MeetingRecorder:
             **kwargs,
         )
 
-        # Проверяем успешность старта: ждём до 3 с, детектируем ранний выход ffmpeg
-        # или ошибку soundcard-захвата и прерываем запуск с понятным сообщением.
-        _POLL_STEP = 0.2
-        _STARTUP_TIMEOUT = 3.0
+        # Проверяем успешность старта: ждём до _FFMPEG_STARTUP_TIMEOUT с, детектируем ранний
+        # выход ffmpeg или ошибку soundcard-захвата и прерываем запуск с понятным сообщением.
         elapsed = 0.0
-        while elapsed < _STARTUP_TIMEOUT:
-            time.sleep(_POLL_STEP)
-            elapsed += _POLL_STEP
+        while elapsed < _FFMPEG_STARTUP_TIMEOUT:
+            time.sleep(_FFMPEG_STARTUP_POLL)
+            elapsed += _FFMPEG_STARTUP_POLL
             if self._process.poll() is not None:
                 self._fail_startup_ffmpeg()
             if self._sys_capture is not None and self._sys_capture.error is not None:
@@ -234,10 +239,10 @@ class MeetingRecorder:
             pass
         try:
             if self._process:
-                self._process.wait(timeout=5)
+                self._process.wait(timeout=_FFMPEG_GRACEFUL_STOP_TIMEOUT)
         except subprocess.TimeoutExpired:
             self._process.terminate()
-            self._process.wait(timeout=3)
+            self._process.wait(timeout=_FFMPEG_FORCE_KILL_TIMEOUT)
         self._process = None
         try:
             self._stderr_file.close()
@@ -271,11 +276,11 @@ class MeetingRecorder:
             self._sys_capture.signal_stop()
 
         try:
-            self._process.wait(timeout=10)
+            self._process.wait(timeout=_FFMPEG_GRACEFUL_STOP_TIMEOUT)
         except subprocess.TimeoutExpired:
-            logger.warning("ffmpeg не завершился за 10с, завершаю принудительно")
+            logger.warning("ffmpeg не завершился за %ds, завершаю принудительно", _FFMPEG_GRACEFUL_STOP_TIMEOUT)
             self._process.terminate()
-            self._process.wait(timeout=5)
+            self._process.wait(timeout=_FFMPEG_FORCE_KILL_TIMEOUT)
 
         self._recording = False
         if self._stderr_file:
@@ -286,7 +291,7 @@ class MeetingRecorder:
             self._stderr_file = None
 
         if self._sys_capture is not None:
-            self._sys_capture.wait(timeout=10)
+            self._sys_capture.wait(timeout=_SYS_AUDIO_JOIN_TIMEOUT)
             if self._sys_capture.error:
                 logger.error("Системный звук не записан: %s", self._sys_capture.error)
             self._sys_capture = None
@@ -422,7 +427,7 @@ def mux_video(
     return output_path
 
 
-def split_streams(video_path: Path, paths: SessionPaths) -> tuple[Path, Path]:
+def split_streams(video_path: Path, paths: SessionPaths, sample_rate: int = 48000) -> tuple[Path, Path]:
     """Извлечь аудио-дорожки из одного video-файла (если ffmpeg записал всё в один файл).
 
     Эта функция — запасной вариант, если раздельная запись не сработала.
@@ -430,14 +435,12 @@ def split_streams(video_path: Path, paths: SessionPaths) -> tuple[Path, Path]:
     if not video_path.exists():
         raise FileNotFoundError(f"Файл не найден: {video_path}")
 
-    # Попробуем извлечь дорожки из видеофайла
-    # Дорожка 1 — микрофон, дорожка 2 — системный звук
     cmd_mic = [
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-map", "0:a:0",
         "-c:a", "pcm_s16le",
-        "-ar", "48000",
+        "-ar", str(sample_rate),
         "-ac", "1",
         str(paths.mic_audio),
     ]
@@ -446,7 +449,7 @@ def split_streams(video_path: Path, paths: SessionPaths) -> tuple[Path, Path]:
         "-i", str(video_path),
         "-map", "0:a:1",
         "-c:a", "pcm_s16le",
-        "-ar", "48000",
+        "-ar", str(sample_rate),
         "-ac", "1",
         str(paths.system_audio),
     ]

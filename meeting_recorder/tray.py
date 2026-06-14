@@ -37,6 +37,13 @@ _STATE_LABELS: dict[str, str] = {
     "error":      "Ошибка",
 }
 
+# Длительность показа статусных сообщений перед возвратом в idle
+_STATUS_DISPLAY_SECS = 4   # успех / завершение операции
+_ERROR_DISPLAY_SECS = 4    # обычная ошибка
+_ERROR_LONG_SECS = 6       # ошибка с длинным описанием (обработка)
+_ERROR_BRIEF_SECS = 3      # кратковременная ошибка ("нет сессий" и т.п.)
+_EXIT_WAIT_SECS = 2        # ожидание остановки записи при выходе
+
 
 def _make_icon(state: str, dim: bool = False) -> Image.Image:
     """Нарисовать круглую иконку 64×64 для заданного состояния."""
@@ -109,9 +116,11 @@ class TrayApp:
         return f"Meeting Recorder — {self._status_msg}{suffix}"
 
     def _elapsed_str(self) -> str:
-        if not self._op_start:
+        with self._lock:
+            op_start = self._op_start
+        if not op_start:
             return ""
-        sec = int(time.monotonic() - self._op_start)
+        sec = int(time.monotonic() - op_start)
         return f"{sec // 60:02d}:{sec % 60:02d}"
 
     # ------------------------------------------------------------------
@@ -199,7 +208,7 @@ class TrayApp:
         except Exception as exc:
             logger.error("Ошибка старта записи: %s", exc)
             self._set_state("error", str(exc)[:60])
-            time.sleep(4)
+            time.sleep(_ERROR_DISPLAY_SECS)
             self._set_state("idle")
 
     def _start_ticker(self) -> None:
@@ -259,7 +268,7 @@ class TrayApp:
             else:
                 logger.warning("Нет аудиофайлов для сведения")
                 self._set_state("error", "Аудиофайлы не найдены")
-                time.sleep(4)
+                time.sleep(_ERROR_DISPLAY_SECS)
                 self._set_state("idle")
                 return None
         except Exception as exc:
@@ -284,7 +293,7 @@ class TrayApp:
             return
         self._notify("Meeting Recorder", f"Запись остановлена: {paths.session_id}")
         self._set_state("idle", "Запись остановлена")
-        time.sleep(4)
+        time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")
 
     def _do_process(self, paths: SessionPaths) -> None:
@@ -304,14 +313,14 @@ class TrayApp:
             generate_protocol(result, paths, self.cfg)
             generate_summary(result, paths, self.cfg)
 
-            self._notify(f"Meeting Recorder", f"Готово: {paths.session_id}")
+            self._notify("Meeting Recorder", f"Готово: {paths.session_id}")
             self._set_state("idle", "Готово")
-            time.sleep(4)
+            time.sleep(_STATUS_DISPLAY_SECS)
             self._set_state("idle")
         except Exception as exc:
             logger.error("Ошибка обработки: %s", exc, exc_info=True)
             self._set_state("error", str(exc)[:60])
-            time.sleep(6)
+            time.sleep(_ERROR_LONG_SECS)
             self._set_state("idle")
 
     def _on_chat(self, icon, item) -> None:
@@ -326,7 +335,7 @@ class TrayApp:
 
         if paths is None:
             self._set_state("error", "Нет сессии с транскриптом для чата")
-            time.sleep(3)
+            time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
 
@@ -351,7 +360,7 @@ class TrayApp:
         except Exception as exc:
             logger.error("Не удалось открыть терминал: %s", exc)
             self._set_state("error", "Не удалось открыть терминал")
-            time.sleep(3)
+            time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
 
     def _on_process_session(self, icon, item) -> None:
@@ -366,7 +375,7 @@ class TrayApp:
             paths = self._pick_session(need_mix=True)
         if paths is None:
             self._set_state("error", "Нет сессии с аудио для обработки")
-            time.sleep(3)
+            time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
         self._do_process(paths)
@@ -383,7 +392,7 @@ class TrayApp:
             paths = self._pick_session(need_transcript=True)
         if paths is None:
             self._set_state("error", "Нет сессии с транскриптом")
-            time.sleep(3)
+            time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
 
@@ -400,7 +409,7 @@ class TrayApp:
         except Exception as exc:
             logger.error("Ошибка генерации отчёта: %s", exc)
             self._set_state("error", str(exc)[:60])
-        time.sleep(4)
+        time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")
 
     def _pick_session(
@@ -435,7 +444,7 @@ class TrayApp:
         sessions = list_sessions(self.cfg.output_dir)
         if not sessions:
             self._set_state("error", "Нет сессий для mux")
-            time.sleep(3)
+            time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
 
@@ -455,7 +464,7 @@ class TrayApp:
 
         if paths is None:
             self._set_state("error", "Нет сессии с видео и аудио")
-            time.sleep(3)
+            time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
 
@@ -468,7 +477,7 @@ class TrayApp:
         except Exception as exc:
             logger.error("Ошибка mux: %s", exc)
             self._set_state("error", str(exc)[:60])
-        time.sleep(4)
+        time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")
 
     def _on_open_last_session_folder(self, icon, item) -> None:
@@ -496,8 +505,7 @@ class TrayApp:
     def _on_exit(self, icon, item) -> None:
         if self.state == "recording":
             threading.Thread(target=self._do_stop, daemon=True).start()
-            # Даём секунду на graceful stop перед выходом
-            time.sleep(2)
+            time.sleep(_EXIT_WAIT_SECS)
         icon.stop()
 
     # ------------------------------------------------------------------
