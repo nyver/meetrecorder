@@ -86,11 +86,22 @@
 {% if transcript %}
 <div id="tab-transcript" class="tab-panel {% if first == 'transcript' %}active{% endif %} card"
      style="padding: 12px 16px">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+    <input id="transcript-search"
+           type="search"
+           placeholder="Поиск в транскрипте…"
+           oninput="filterTranscript(this.value)"
+           style="flex:1;padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;
+                  font-size:.85rem;outline:none;background:#f8fafc;color:#0f172a">
+    <span id="search-count" style="font-size:.8rem;color:#94a3b8;white-space:nowrap"></span>
+  </div>
   <div class="transcript-list" id="tlist">
     {% for seg in transcript %}
     <div class="seg"
          data-start="{{ seg.start }}"
          data-end="{{ seg.end }}"
+         data-text="{{ seg.text|lower }}"
+         data-speaker="{{ seg.speaker|lower }}"
          onclick="seek({{ seg.start }})">
       <span class="ts">{{ seg.start|ts }}</span>
       <span class="sp" style="color:{{ seg.color }}">{{ seg.speaker }}</span>
@@ -114,6 +125,38 @@
 
 {# ---- JavaScript ---- #}
 <script>
+function filterTranscript(query) {
+  var q = query.trim().toLowerCase();
+  var segs = document.querySelectorAll('#tlist .seg');
+  var matched = 0;
+
+  segs.forEach(function (el) {
+    var txt = el.getAttribute('data-text') || '';
+    var spk = el.getAttribute('data-speaker') || '';
+    var hit = !q || txt.indexOf(q) !== -1 || spk.indexOf(q) !== -1;
+    el.style.display = hit ? '' : 'none';
+
+    // Подсветка совпадений в тексте
+    var txEl = el.querySelector('.tx');
+    if (txEl) {
+      if (!q || txt.indexOf(q) === -1) {
+        txEl.innerHTML = txEl.textContent;
+      } else {
+        var raw = txEl.textContent;
+        var re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+        txEl.innerHTML = raw.replace(re, '<mark style="background:#fef08a;border-radius:2px">$1</mark>');
+      }
+    }
+
+    if (hit) matched++;
+  });
+
+  var countEl = document.getElementById('search-count');
+  if (countEl) {
+    countEl.textContent = q ? matched + ' / ' + segs.length : '';
+  }
+}
+
 function switchTab(id, btn) {
   document.querySelectorAll('.tab-panel').forEach(function(p) {
     p.classList.remove('active');
