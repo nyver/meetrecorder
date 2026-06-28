@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import AppConfig
 from .naming import SessionPaths
+from .report import _format_timestamp as _fmt_ts, _session_datetime as _parse_dt_impl
 
 logger = logging.getLogger(__name__)
 
@@ -26,17 +27,9 @@ _SPEAKER_COLORS = [
 
 def _parse_dt(session_id: str) -> datetime | None:
     try:
-        parts = session_id.split("_")
-        return datetime.strptime(f"{parts[1]}_{parts[2]}", "%Y-%m-%d_%H-%M-%S")
+        return _parse_dt_impl(session_id)
     except Exception:
         return None
-
-
-def _fmt_ts(seconds: float) -> str:
-    """Секунды → MM:SS для Jinja2-фильтра."""
-    m = int(seconds) // 60
-    s = int(seconds) % 60
-    return f"{m:02d}:{s:02d}"
 
 
 def _session_meta(paths: SessionPaths, cfg: AppConfig) -> dict[str, Any]:
@@ -154,22 +147,25 @@ def create_app(cfg: AppConfig) -> Any:
 
         transcript: list[dict[str, Any]] = []
         if paths.transcript.exists():
-            data = json.loads(paths.transcript.read_text(encoding="utf-8"))
-            names = cfg.transcription.speaker_names
-            unique_spk = sorted({seg.get("speaker", "?") for seg in data.get("segments", [])})
-            colors = {
-                sp: _SPEAKER_COLORS[i % len(_SPEAKER_COLORS)]
-                for i, sp in enumerate(unique_spk)
-            }
-            for seg in data.get("segments", []):
-                sp = seg.get("speaker", "?")
-                transcript.append({
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "speaker": names.get(sp, sp),
-                    "color": colors.get(sp, "#333"),
-                    "text": seg.get("text", "").strip(),
-                })
+            try:
+                data = json.loads(paths.transcript.read_text(encoding="utf-8"))
+                names = cfg.transcription.speaker_names
+                unique_spk = sorted({seg.get("speaker", "?") for seg in data.get("segments", [])})
+                colors = {
+                    sp: _SPEAKER_COLORS[i % len(_SPEAKER_COLORS)]
+                    for i, sp in enumerate(unique_spk)
+                }
+                for seg in data.get("segments", []):
+                    sp = seg.get("speaker", "?")
+                    transcript.append({
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "speaker": names.get(sp, sp),
+                        "color": colors.get(sp, "#333"),
+                        "text": seg.get("text", "").strip(),
+                    })
+            except Exception:
+                logger.warning("Не удалось прочитать транскрипт: %s", paths.transcript)
 
         highlights: list[dict[str, Any]] = []
         if paths.highlights.exists():

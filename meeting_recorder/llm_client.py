@@ -142,14 +142,19 @@ class LLMClient:
         self.close()
 
 
-def create_llm_client(cfg: LLMConfig) -> LLMClient:
-    """Создать LLM-клиент из LLMConfig."""
+def create_llm_client(cfg: LLMConfig, *, check_health: bool = False) -> LLMClient:
+    """Создать LLM-клиент из LLMConfig.
+
+    Args:
+        check_health: Если True — проверить доступность сервера перед возвратом.
+            По умолчанию False: проверка происходит lazily при первом вызове chat(),
+            что экономит один HTTP-запрос на каждую операцию.
+    """
     logger.info(
         "Создаю LLM-клиент: backend=%s, model=%s, base_url=%s",
         cfg.backend, cfg.model, cfg.base_url,
     )
 
-    # Предупреждение для openrouter
     if cfg.backend == "openrouter":
         logger.warning(
             "Режим openrouter: транскрипт будет отправлен во внешний сервис (OpenRouter). "
@@ -158,8 +163,7 @@ def create_llm_client(cfg: LLMConfig) -> LLMClient:
 
     client = LLMClient(cfg)
 
-    # Проверка доступности
-    if not client.health_check():
+    if check_health and not client.health_check():
         raise LLMClientError(
             f"LLM-бэкенд недоступен: {cfg.base_url}. "
             f"Для локального режима запустите llama-server. "

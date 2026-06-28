@@ -102,20 +102,22 @@ def mix_audio_files(
     data_mic, sr_mic = sf.read(mic_path, dtype="float32")
     data_sys, sr_sys = sf.read(system_path, dtype="float32")
 
-    # Привести к общей частоте
-    if sr_mic != sr_sys:
-        logger.warning(
-            "Несоответствие частот: mic=%d, system=%d. Приведение system к %d",
-            sr_mic, sr_sys, sr_mic,
-        )
-        try:
-            import resampy
-            data_sys = resampy.resample(data_sys, sr_sys, sr_mic)
-        except ImportError:
-            logger.warning("resampy не установлен — пропускаю ресемплинг")
-
     if len(data_mic) == 0 or len(data_sys) == 0:
         raise ValueError("Один из аудиофайлов пустой")
+
+    # Привести к общей частоте
+    if sr_mic != sr_sys:
+        try:
+            import resampy
+            logger.info(
+                "Ресемплинг системного аудио: %d → %d Гц", sr_sys, sr_mic,
+            )
+            data_sys = resampy.resample(data_sys, sr_sys, sr_mic)
+        except ImportError:
+            raise RuntimeError(
+                f"Несовпадение частот дискретизации (mic={sr_mic} Гц, system={sr_sys} Гц). "
+                f"Установите resampy для автоматического ресемплинга: pip install resampy"
+            )
 
     # Выравниваем по концу записи, а не по началу.
     # soundcard стартует раньше ffmpeg (~2-5 с на инициализацию gdigrab/dshow),
@@ -124,21 +126,25 @@ def mix_audio_files(
     len_diff = len(data_sys) - len(data_mic)
     if len_diff > 0:
         data_sys = data_sys[len_diff:]
-        logger.debug("Синхронизация аудио: обрезано %d кадров (%.2f с) с начала system", len_diff, len_diff / sr_sys)
+        logger.debug("Синхронизация аудио: обрезано %d кадров (%.2f с) с начала system", len_diff, len_diff / sr_mic)
     elif len_diff < 0:
         data_mic = data_mic[-len_diff:]
         logger.debug("Синхронизация аудио: обрезано %d кадров (%.2f с) с начала mic", -len_diff, -len_diff / sr_mic)
 
-    # Если моно — сделать 2D
-    if data_mic.ndim == 1:
+    # Привести оба потока к моно перед смешиванием
+    if data_mic.ndim > 1:
+        data_mic = data_mic[:, :1]
+    else:
         data_mic = data_mic[:, np.newaxis]
-    if data_sys.ndim == 1:
+    if data_sys.ndim > 1:
+        data_sys = data_sys[:, :1]
+    else:
         data_sys = data_sys[:, np.newaxis]
 
     # Свести по среднему
     mixed = (data_mic + data_sys) / 2
 
-    sf.write(str(output_path), mixed, sample_rate, subtype="PCM_16")
+    sf.write(str(output_path), mixed, sr_mic, subtype="PCM_16")
     logger.info("Сведённое аудио сохранено: %s", output_path)
     return output_path
 

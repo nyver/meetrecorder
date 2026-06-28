@@ -89,7 +89,10 @@ def run_record(cfg: AppConfig) -> SessionPaths:
         )
     elif paths.mic_audio.exists():
         # Если нет системного звука — используем микрофон
-        paths.mic_audio.rename(paths.mix_audio)
+        try:
+            paths.mic_audio.rename(paths.mix_audio)
+        except OSError as exc:
+            raise PipelineError(f"Не удалось переименовать аудиофайл: {exc}") from exc
         logger.warning("Системный звук отсутствует, используем микрофон для микса")
     else:
         raise PipelineError(

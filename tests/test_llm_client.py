@@ -207,10 +207,20 @@ class TestCreateLLMClient:
         cfg = _cfg()
         with patch("meeting_recorder.llm_client.LLMClient") as MockClient:
             inst = MagicMock()
-            inst.health_check.return_value = True
             MockClient.return_value = inst
             result = create_llm_client(cfg)
             assert result is inst
+            inst.health_check.assert_not_called()  # по умолчанию check_health=False
+
+    def test_check_health_true_success(self):
+        cfg = _cfg()
+        with patch("meeting_recorder.llm_client.LLMClient") as MockClient:
+            inst = MagicMock()
+            inst.health_check.return_value = True
+            MockClient.return_value = inst
+            result = create_llm_client(cfg, check_health=True)
+            assert result is inst
+            inst.health_check.assert_called_once()
 
     def test_unavailable_raises(self):
         cfg = _cfg()
@@ -219,7 +229,7 @@ class TestCreateLLMClient:
             inst.health_check.return_value = False
             MockClient.return_value = inst
             with pytest.raises(LLMClientError, match="недоступен"):
-                create_llm_client(cfg)
+                create_llm_client(cfg, check_health=True)
 
     def test_openrouter_logs_warning(self, caplog):
         import logging

@@ -560,7 +560,7 @@ def chat_cmd(ctx, session_id: str | None):
     history: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
     try:
-        client = create_llm_client(cfg.llm)
+        client = create_llm_client(cfg.llm, check_health=True)
     except LLMClientError as e:
         print(f"❌ LLM недоступен: {e}")
         sys.exit(1)

@@ -295,6 +295,10 @@ class TrayApp:
                 return None
         except Exception as exc:
             logger.error("Ошибка сведения аудио: %s", exc)
+            self._set_state("error", f"Сведение аудио: {str(exc)[:60]}")
+            time.sleep(_ERROR_DISPLAY_SECS)
+            self._set_state("idle")
+            return None
 
         return paths
 

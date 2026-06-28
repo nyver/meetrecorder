@@ -19,29 +19,29 @@ _model_cache_lock = threading.Lock()
 
 
 def _get_transcribe_model(model_name: str, device: str, dtype: str | None = None):
-    """Загрузить Whisper-модель с кэшированием (thread-safe)."""
+    """Загрузить Whisper-модель с кэшированием (thread-safe).
+
+    Лок удерживается на всё время загрузки, чтобы не допустить одновременной
+    загрузки одной модели двумя потоками (риск OOM на GPU).
+    """
     key = f"{model_name}_{device}_{dtype}"
     with _model_cache_lock:
         if key in _model_cache:
             return _model_cache[key]
 
-    from faster_whisper import WhisperModel
+        from faster_whisper import WhisperModel
 
-    logger.info("Загрузка модели Whisper (model=%s, device=%s, dtype=%s)…", model_name, device, dtype)
-    model = WhisperModel(
-        model_name,
-        device=device,
-        compute_type=dtype or ("float16" if device == "cuda" else "int8"),
-        num_workers=4,
-        download_root=Path.home() / ".cache" / "whisper",
-    )
-    logger.info("Модель Whisper загружена")
-
-    with _model_cache_lock:
-        # Двойная проверка: другой поток мог загрузить модель пока мы ждали
-        if key not in _model_cache:
-            _model_cache[key] = model
-        return _model_cache[key]
+        logger.info("Загрузка модели Whisper (model=%s, device=%s, dtype=%s)…", model_name, device, dtype)
+        model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=dtype or ("float16" if device == "cuda" else "int8"),
+            num_workers=4,
+            download_root=Path.home() / ".cache" / "whisper",
+        )
+        logger.info("Модель Whisper загружена")
+        _model_cache[key] = model
+        return model
 
 
 def _patch_torchaudio_compat() -> None:
@@ -175,45 +175,46 @@ def _patch_speechbrain_lazy_module() -> None:
 
 
 def _get_diarization_model(cfg: AppConfig):
-    """Загрузить pyannote.audio диаризацию с кэшированием (thread-safe)."""
+    """Загрузить pyannote.audio диаризацию с кэшированием (thread-safe).
+
+    Лок удерживается на всё время загрузки — аналогично _get_transcribe_model.
+    """
     key = "diarization"
     with _model_cache_lock:
         if key in _model_cache:
             return _model_cache[key]
 
-    try:
-        _patch_torchaudio_compat()
-        _patch_hf_use_auth_token()
-        _patch_torch_load_compat()
-        _patch_speechbrain_lazy_module()
-        from pyannote.audio import Pipeline
-    except (ImportError, Exception) as e:
-        logger.warning("pyannote.audio недоступна — диаризация отключена: %s", e)
-        return None
+        try:
+            _patch_torchaudio_compat()
+            _patch_hf_use_auth_token()
+            _patch_torch_load_compat()
+            _patch_speechbrain_lazy_module()
+            from pyannote.audio import Pipeline
+        except Exception as e:
+            logger.warning("pyannote.audio недоступна — диаризация отключена: %s", e)
+            return None
 
-    hf_token = cfg.transcription.hf_token.get_secret_value()
-    if not hf_token:
-        logger.warning(
-            "HF_TOKEN не указан — диаризация будет отключена. "
-            "Установите токен на huggingface.co/settings/tokens"
+        hf_token = cfg.transcription.hf_token.get_secret_value()
+        if not hf_token:
+            logger.warning(
+                "HF_TOKEN не указан — диаризация будет отключена. "
+                "Установите токен на huggingface.co/settings/tokens"
+            )
+            return None
+
+        logger.info("Загрузка pyannote.pipeline (device=%s)…", cfg.transcription.device)
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token,
         )
-        return None
-
-    logger.info("Загрузка pyannote.pipeline (device=%s)…", cfg.transcription.device)
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
-    )
-    try:
-        import torch
-        pipeline.to(torch.device(cfg.transcription.device))
-    except Exception as e:
-        logger.warning("Не удалось перенести pyannote на %s: %s", cfg.transcription.device, e)
-    with _model_cache_lock:
-        if key not in _model_cache:
-            _model_cache[key] = pipeline
-    logger.info("pyannote.pipeline загружена")
-    return pipeline
+        try:
+            import torch
+            pipeline.to(torch.device(cfg.transcription.device))
+        except Exception as e:
+            logger.warning("Не удалось перенести pyannote на %s: %s", cfg.transcription.device, e)
+        _model_cache[key] = pipeline
+        logger.info("pyannote.pipeline загружена")
+        return pipeline
 
 
 class Segment:
