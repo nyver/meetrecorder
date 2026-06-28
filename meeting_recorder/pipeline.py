@@ -12,7 +12,7 @@ from .llm_client import LLMClientError
 from .naming import SessionPaths, create_session, list_sessions, resolve_session
 from .recorder import MeetingRecorder, mix_audio_files
 from .html_report import generate_html_protocol
-from .report import generate_protocol, generate_summary
+from .report import generate_highlights, generate_protocol, generate_summary
 from .transcriber import transcribe
 
 logger = logging.getLogger(__name__)
@@ -142,6 +142,12 @@ def run_report(
     protocol_path = generate_protocol(data, paths, cfg)
     summary_path = generate_summary(data, paths, cfg)
 
+    # Ключевые моменты — необязательный шаг, ошибки не блокируют pipeline
+    try:
+        generate_highlights(data, paths, cfg)
+    except Exception as exc:
+        logger.warning("Не удалось сгенерировать ключевые моменты: %s", exc)
+
     # HTML-протокол генерируется как необязательный шаг — ошибки не блокируют pipeline
     try:
         generate_html_protocol(data, paths, cfg)
@@ -245,6 +251,17 @@ def run_report_only(
 
     protocol_path, summary_path = run_report(cfg, paths)
     return protocol_path, summary_path
+
+
+def run_highlights_only(cfg: AppConfig, session_id: str) -> Path:
+    """Сгенерировать ключевые моменты для существующей сессии."""
+    paths = resolve_session(cfg.output_dir, session_id)
+    if not paths.transcript.exists():
+        raise PipelineError(
+            f"Транскрипт не найден: {paths.transcript}. Сначала выполните транскрипцию."
+        )
+    data = transcriber_load_transcript(paths.transcript)
+    return generate_highlights(data, paths, cfg)
 
 
 def run_process(

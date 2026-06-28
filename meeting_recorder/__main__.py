@@ -22,7 +22,7 @@ import click
 
 from meeting_recorder.config import AppConfig, load_config
 from meeting_recorder.naming import list_sessions, resolve_session
-from meeting_recorder.pipeline import PipelineError, run_html, run_process, run_report_only, run_transcribe_only
+from meeting_recorder.pipeline import PipelineError, run_highlights_only, run_html, run_process, run_report_only, run_transcribe_only
 
 logger = logging.getLogger("meeting_recorder")
 
@@ -677,6 +677,36 @@ def tray_cmd(ctx):
     cfg = ctx.obj["cfg"]
     from meeting_recorder.tray import TrayApp
     TrayApp(cfg).run()
+
+
+@cli.command("highlights")
+@click.argument("session_id", required=False, default=None)
+@click.pass_context
+def highlights_cmd(ctx, session_id: str | None):
+    """Сгенерировать 5 ключевых моментов встречи через LLM.
+
+    SESSION_ID — идентификатор сессии (по умолчанию последняя с транскриптом).
+    Результат сохраняется в *_highlights.json рядом с транскриптом.
+    """
+    cfg = ctx.obj["cfg"]
+
+    if session_id is None:
+        sessions = list_sessions(cfg.output_dir)
+        candidates = [s for s in sessions if s.transcript.exists()]
+        if not candidates:
+            print(f"❌ Нет сессий с транскриптом в {cfg.output_dir}")
+            sys.exit(1)
+        session_id = candidates[-1].session_id
+        print(f"ℹ Используется последняя сессия с транскриптом: {session_id}")
+
+    print("⭐ Генерирую ключевые моменты…")
+    try:
+        highlights_path = run_highlights_only(cfg, session_id)
+    except PipelineError as e:
+        print(f"❌ Ошибка: {e}")
+        sys.exit(1)
+
+    print(f"\n✅ Ключевые моменты сохранены: {highlights_path}")
 
 
 @cli.command("html")

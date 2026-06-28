@@ -257,6 +257,62 @@ def _map_reduce_summary(
     return client.chat([{"role": "user", "content": reduce_prompt}])
 
 
+# ---------------------------------------------------------------------------
+# Интересные моменты (Highlights)
+# ---------------------------------------------------------------------------
+
+
+def generate_highlights(
+    transcript: dict[str, Any] | Path | str,
+    paths: SessionPaths,
+    cfg: AppConfig,
+) -> Path:
+    """Сгенерировать 5 ключевых моментов встречи через LLM.
+
+    Сохраняет JSON-список [{title, description, start}] в *_highlights.json.
+    """
+    import json as _json
+
+    from .llm_client import create_llm_client
+
+    if isinstance(transcript, (Path, str)):
+        data = load_transcript(transcript)
+    else:
+        data = transcript
+
+    speaker_names = cfg.transcription.speaker_names
+    lines: list[str] = []
+    for seg in data.get("segments", []):
+        sp = seg.get("speaker", "?")
+        sp = speaker_names.get(sp, sp)
+        ts = _format_timestamp(seg["start"])
+        lines.append(f"[{ts}] {sp}: {seg.get('text', '').strip()}")
+
+    transcript_text = "\n".join(lines)
+    template = (_PROMPTS_DIR / "highlights.md").read_text(encoding="utf-8")
+    prompt = template.replace("{transcript_text}", transcript_text)
+
+    with create_llm_client(cfg.llm) as client:
+        response = client.chat([{"role": "user", "content": prompt}])
+
+    response = response.strip()
+    if response.startswith("```"):
+        response = "\n".join(
+            line for line in response.split("\n") if not line.startswith("```")
+        )
+
+    highlights = _json.loads(response.strip())
+    if not isinstance(highlights, list):
+        raise ValueError("LLM вернул не массив для highlights")
+
+    paths.highlights.write_text(
+        _json.dumps(highlights, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("Ключевые моменты сохранены: %s", paths.highlights)
+    return paths.highlights
+
+
 def _split_text_into_chunks(text: str, max_chars: int) -> list[str]:
     """Разбить текст на чанки не больше max_chars, разрывая по абзацам."""
     chunks = []

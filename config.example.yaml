@@ -1,84 +1,120 @@
-output_dir: C:/Meetings
+# Meeting Recorder — пример конфигурации
+# Скопируйте в config.yaml и отредактируйте перед использованием.
+# Чувствительные значения можно задать через переменные окружения:
+#   HF_TOKEN     — токен HuggingFace для pyannote (диаризация)
+#   LLM_API_KEY  — API-ключ LLM (для backend: openrouter)
 
+# Папка для сохранения записей и артефактов
+output_dir: "C:/Meetings"
+
+# ---------------------------------------------------------------------------
+# Запись экрана и звука
+# ---------------------------------------------------------------------------
 recording:
+  # Частота кадров видео
   fps: 20
-  video_codec: libx264
+
+  # Кодек видео (libx264 — универсальный)
+  video_codec: "libx264"
+
+  # Частота дискретизации аудио (Гц)
   audio_sample_rate: 48000
 
-  # Имя микрофона из списка dshow-устройств
-  # Узнать список: ffmpeg -list_devices true -f dshow -i dummy
-  mic_device: Микрофон (Realtek Audio)
+  # Имя микрофона (dshow-имя устройства). Найти список:
+  #   ffmpeg -list_devices true -f dshow -i dummy 2>&1 | grep "(audio)"
+  mic_device: "Microphone (Realtek High Definition Audio)"
 
-  # Захват системного аудио (то, что слышно в колонках/наушниках)
-  # soundcard — WASAPI loopback через Python, рекомендуется, не требует доп. драйверов
-  # wasapi   — через ffmpeg WASAPI (нужна сборка ffmpeg с поддержкой WASAPI)
-  # dshow    — через виртуальное устройство (Stereo Mix / VB-Cable)
-  system_audio_grabber: soundcard
+  # Захват системного звука:
+  #   soundcard  — WASAPI loopback через Python (рекомендуется, не требует
+  #                спецсборки ffmpeg)
+  #   wasapi     — через ffmpeg WASAPI (нужна сборка с поддержкой WASAPI)
+  #   dshow      — через виртуальное устройство (Stereo Mix / VB-Cable)
+  system_audio_grabber: "soundcard"
 
-  # Имя виртуального устройства — используется только при system_audio_grabber: dshow
-  system_audio_device: Stereo Mix (Realtek High Definition Audio)
+  # Имя loopback-устройства (только для system_audio_grabber: dshow или wasapi)
+  system_audio_device: "Stereo Mix (Realtek High Definition Audio)"
 
-  # false — записывать только микрофон (отключить захват системного звука)
+  # true — записывать системный звук, false — только микрофон
   record_system_audio: true
 
-  # ddagrab — аппаратный захват через DXGI (быстрее, требует ffmpeg с поддержкой DXGI)
-  # gdigrab — GDI-захват (совместимее, работает везде)
-  screen_grabber: gdigrab
+  # Захват экрана:
+  #   ddagrab  — через DXGI Desktop Duplication (быстрее, требует ffmpeg >= 6.1)
+  #   gdigrab  — GDI-захват (совместимее, но медленнее; не захватывает UAC/DRM)
+  screen_grabber: "gdigrab"
 
+# ---------------------------------------------------------------------------
+# Транскрипция и диаризация (WhisperX + pyannote)
+# ---------------------------------------------------------------------------
 transcription:
-  # Модели Whisper (faster-whisper):
-  #   large-v3       — максимальное качество
-  #   large-v3-turbo — 6-8x быстрее large-v3, разница по WER <2% для русского (рекомендуется)
-  #   medium         — компромисс для CPU без GPU
-  model: large-v3-turbo
+  # Модель Whisper:
+  #   large-v3-turbo  — в 6-8x быстрее large-v3, WER для русского хуже <2%
+  #                     (рекомендуется для GPU)
+  #   large-v3        — максимальное качество
+  #   medium          — компромисс, приемлем на CPU
+  model: "large-v3-turbo"
 
-  language: ru
+  # Язык аудио (ru, en, de, … — или auto для автоопределения)
+  language: "ru"
+
+  # true — включить диаризацию (определение говорящих через pyannote)
   diarization: true
 
-  # cuda — использовать GPU (рекомендуется, значительно быстрее)
-  # cpu  — только процессор
-  device: cuda
+  # Устройство инференса: cuda (GPU NVIDIA) или cpu
+  device: "cuda"
 
-  # Размер луча при декодировании (beam search)
-  # beam_size=1 (greedy) — в ~3-4x быстрее beam_size=5, потеря точности минимальна
-  # beam_size=5 — стандартное качество
+  # beam_size=1 (greedy) в ~3-4x быстрее beam_size=5 при минимальной потере точности
   beam_size: 1
 
-  # Размер батча для BatchedInferencePipeline (параллельная обработка чанков на GPU)
-  # 0    — авто: 16 на cuda, без батчинга на cpu
-  # 8-32 — задать вручную (больше = быстрее, но больше VRAM)
+  # batch_size=0 → авто (16 на cuda, без батчинга на cpu).
+  # BatchedInferencePipeline даёт 3-5x ускорение на GPU.
   batch_size: 0
 
-  # Токен HuggingFace — нужен для диаризации (pyannote/speaker-diarization-3.1)
+  # Токен HuggingFace для загрузки pyannote (диаризация).
   # Получить: https://huggingface.co/settings/tokens
-  # Можно задать через переменную окружения HF_TOKEN вместо прописывания здесь
-  # hf_token: hf_xxxxxxxxxxxxxxxxxxxx
+  # Принять лицензии: pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0
+  # Можно оставить пустым и задать через переменную окружения HF_TOKEN.
+  hf_token: ""
 
-  # Имена участников встречи (SPEAKER_00, SPEAKER_01, ...)
-  # Порядок соответствует порядку первого появления говорящего
+  # Псевдонимы говорящих: SPEAKER_00 → реальное имя.
+  # Оставьте пустым или добавьте столько записей, сколько участников.
   speaker_names:
-    SPEAKER_00: Иван
-    SPEAKER_01: Мария
-    SPEAKER_02: Алексей
+    SPEAKER_00: "Иван"
+    SPEAKER_01: "Мария"
+    SPEAKER_02: "Алексей"
 
+# ---------------------------------------------------------------------------
+# LLM — генерация summary, ключевых моментов (highlights), чат по встрече
+# ---------------------------------------------------------------------------
 llm:
-  # local      — локальный llama.cpp сервер (llama-server)
-  # openrouter — облачный API через openrouter.ai
-  backend: local
-  base_url: http://127.0.0.1:8080/v1
-  # base_url: https://openrouter.ai/api/v1
+  # Бэкенд:
+  #   local       — llama-server на вашем ПК (данные не покидают машину)
+  #   openrouter  — облако OpenRouter (транскрипт отправляется во внешний сервис)
+  backend: "local"
 
-  # Псевдоним модели в llama-server или ID модели на OpenRouter
-  model: qwen2.5-14b-instruct
-  # model: openai/gpt-4o-mini
+  # URL OpenAI-совместимого API
+  base_url: "http://127.0.0.1:8080/v1"
+  # base_url: "https://openrouter.ai/api/v1"
 
-  # Ключ API — для OpenRouter обязателен, для локального сервера не нужен
-  # Можно задать через переменную окружения LLM_API_KEY
-  # api_key: sk-or-xxxxxxxxxxxxxxxxxxxx
+  # Идентификатор модели (алиас llama-server или название модели на OpenRouter)
+  model: "my-model-alias"
+  # model: "openai/gpt-4o-mini"
+  # model: "anthropic/claude-3.5-haiku"
+  # model: "deepseek/deepseek-r1"
 
+  # API-ключ (для OpenRouter обязателен; для локального сервера не нужен).
+  # Рекомендуется задать через переменную окружения LLM_API_KEY.
+  # api_key: "sk-or-xxxxxxxxxxxxxxxxxxxx"
+
+  # Температура генерации (0.0 – детерминировано, 1.0 – творчески)
   temperature: 0.3
+
+  # Максимальное число токенов в ответе LLM.
+  # Для thinking-моделей (DeepSeek-R1 и аналогов) рекомендуется >= 16384.
   max_tokens: 16384
-  # clean_protocol: true — убирать markdown-форматирование из протокола
+
+  # true — дополнительно отшлифовать markdown-протокол через LLM
   clean_protocol: false
-  # Таймаут запроса к LLM в секундах (увеличьте для длинных встреч)
+
+  # Таймаут одного запроса к LLM (секунды).
+  # Увеличьте до 600+ для больших транскриптов на медленном GPU.
   timeout: 600

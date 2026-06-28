@@ -487,3 +487,269 @@ class TestOnExit:
             with patch("meeting_recorder.tray.time.sleep"):
                 app._on_exit(mock_icon, MagicMock())
         mock_icon.stop.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _pick_session — need_no_highlights
+# ---------------------------------------------------------------------------
+
+class TestPickSessionNoHighlights:
+    def test_skips_session_with_highlights(self, app, tmp_path):
+        s1 = _make_session(tmp_path, transcript=True)
+        s2 = _make_session(tmp_path, transcript=True)
+        s2.highlights.write_text("[]", encoding="utf-8")
+        app.cfg.output_dir = str(tmp_path)
+
+        result = app._pick_session(need_transcript=True, need_no_highlights=True)
+        assert result is not None
+        assert result.session_id == s1.session_id
+
+    def test_falls_back_when_all_have_highlights(self, app, tmp_path):
+        s = _make_session(tmp_path, transcript=True)
+        s.highlights.write_text("[]", encoding="utf-8")
+        app.cfg.output_dir = str(tmp_path)
+
+        result = app._pick_session(need_transcript=True, need_no_highlights=True)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _fmt_session_label
+# ---------------------------------------------------------------------------
+
+class TestFmtSessionLabel:
+    def test_standard_session_id(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        label = app._fmt_session_label(s)
+        assert "20" in label
+        assert ":" in label
+
+    def test_suffixed_session_id(self, app, tmp_path):
+        from meeting_recorder.naming import SessionPaths
+        paths = SessionPaths(str(tmp_path), "meeting_2026-06-28_15-30-00_2")
+        paths.ensure_dir()
+        label = app._fmt_session_label(paths)
+        assert "#2" in label
+
+    def test_invalid_id_returns_raw(self, app, tmp_path):
+        from meeting_recorder.naming import SessionPaths
+        paths = SessionPaths(str(tmp_path), "bad_id")
+        paths.ensure_dir()
+        label = app._fmt_session_label(paths)
+        assert label == "bad_id"
+
+
+# ---------------------------------------------------------------------------
+# _brief_summary
+# ---------------------------------------------------------------------------
+
+class TestBriefSummary:
+    def test_no_summary_file(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        result = app._brief_summary(s)
+        assert result == []
+
+    def test_extracts_brief_section(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        s.summary.write_text(
+            "# Summary\n\n## Краткое резюме\n\nКоманда обсудила бюджет и согласовала план.\n\n## Темы\n- Тема 1",
+            encoding="utf-8",
+        )
+        result = app._brief_summary(s)
+        assert len(result) >= 1
+        assert any("бюджет" in line for line in result)
+
+    def test_skips_bold_lines(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        s.summary.write_text(
+            "# Summary\n\n## Краткое резюме\n\n**Дата:** 2026-06-28\n\nОбсудили бюджет.\n",
+            encoding="utf-8",
+        )
+        result = app._brief_summary(s)
+        assert all("**" not in line for line in result)
+        assert any("бюджет" in line for line in result)
+
+    def test_wraps_long_line(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        long_line = "Слово " * 30
+        s.summary.write_text(
+            f"# Summary\n\n## Краткое резюме\n\n{long_line}\n",
+            encoding="utf-8",
+        )
+        result = app._brief_summary(s)
+        assert len(result) >= 1
+        assert all(len(line) <= 72 for line in result)
+
+    def test_max_4_lines(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        sentences = "\n".join(f"Предложение номер {i} для теста." for i in range(10))
+        s.summary.write_text(f"# S\n\n## Краткое резюме\n\n{sentences}\n", encoding="utf-8")
+        result = app._brief_summary(s)
+        assert len(result) <= 4
+
+    def test_stops_at_next_section(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        s.summary.write_text(
+            "# S\n\n## Краткое резюме\n\nРезюме.\n\n## Другой раздел\n\nНе должно попасть.\n",
+            encoding="utf-8",
+        )
+        result = app._brief_summary(s)
+        assert all("Не должно" not in line for line in result)
+
+    def test_corrupt_file_returns_empty(self, app, tmp_path):
+        s = _make_session(tmp_path)
+        s.summary.write_bytes(b"\xff\xfe\x00 invalid utf8 content \xff")
+        result = app._brief_summary(s)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _build_sessions_items / _build_session_submenu
+# ---------------------------------------------------------------------------
+
+class TestBuildSessionsItems:
+    def test_empty_catalog(self, app):
+        items = app._build_sessions_items()
+        assert len(items) == 1
+        assert items[0].enabled is False
+
+    def test_with_sessions(self, app, tmp_path):
+        for _ in range(3):
+            _make_session(tmp_path)
+        app.cfg.output_dir = str(tmp_path)
+        items = app._build_sessions_items()
+        assert len(items) == 3
+
+    def test_capped_at_25(self, app, tmp_path):
+        for _ in range(30):
+            _make_session(tmp_path)
+        app.cfg.output_dir = str(tmp_path)
+        items = app._build_sessions_items()
+        assert len(items) <= 25
+
+    def test_submenu_callable(self, app, tmp_path):
+        s = _make_session(tmp_path, transcript=True)
+        app.cfg.output_dir = str(tmp_path)
+        items = app._build_sessions_items()
+        assert len(items) == 1
+        # submenu — это pystray.Menu, вызываемое в рантайме
+        submenu = items[0].submenu
+        assert submenu is not None
+
+    def test_submenu_with_summary(self, app, tmp_path):
+        s = _make_session(tmp_path, transcript=True, summary=True)
+        app.cfg.output_dir = str(tmp_path)
+        items = app._build_sessions_items()
+        assert len(items) == 1
+
+
+# ---------------------------------------------------------------------------
+# _do_highlights / _run_highlights_for
+# ---------------------------------------------------------------------------
+
+class TestDoHighlights:
+    def test_no_session_shows_error(self, app):
+        with patch("meeting_recorder.tray.time.sleep"):
+            app._do_highlights()
+        assert app.state == "idle"
+
+    def test_success(self, app, tmp_path):
+        session = _make_session(tmp_path, transcript=True)
+        app.cfg.output_dir = str(tmp_path)
+
+        with patch("meeting_recorder.transcriber.load_transcript", return_value={"segments": []}):
+            with patch("meeting_recorder.report.generate_highlights",
+                       return_value=session.highlights):
+                with patch("meeting_recorder.tray.time.sleep"):
+                    app._do_highlights()
+
+        assert app.state == "idle"
+
+    def test_uses_session_without_highlights_first(self, app, tmp_path):
+        s1 = _make_session(tmp_path, transcript=True)
+        s2 = _make_session(tmp_path, transcript=True)
+        s2.highlights.write_text("[]", encoding="utf-8")
+        app.cfg.output_dir = str(tmp_path)
+
+        picked: list = []
+
+        def _fake_run(paths):
+            picked.append(paths.session_id)
+            with patch("meeting_recorder.tray.time.sleep"):
+                pass
+
+        with patch.object(app, "_run_highlights_for", side_effect=_fake_run):
+            app._do_highlights()
+
+        assert picked and picked[0] == s1.session_id
+
+
+class TestRunHighlightsFor:
+    def test_success(self, app, tmp_path):
+        session = _make_session(tmp_path, transcript=True)
+
+        with patch("meeting_recorder.transcriber.load_transcript", return_value={"segments": []}):
+            with patch("meeting_recorder.report.generate_highlights",
+                       return_value=session.highlights):
+                with patch("meeting_recorder.tray.time.sleep"):
+                    app._run_highlights_for(session)
+
+        assert app.state == "idle"
+
+    def test_error_sets_error_state(self, app, tmp_path):
+        session = _make_session(tmp_path, transcript=True)
+
+        with patch("meeting_recorder.transcriber.load_transcript",
+                   side_effect=RuntimeError("LLM недоступен")):
+            with patch("meeting_recorder.tray.time.sleep"):
+                app._run_highlights_for(session)
+
+        assert app.state == "idle"
+
+
+# ---------------------------------------------------------------------------
+# _do_html_protocol / _run_html_for
+# ---------------------------------------------------------------------------
+
+class TestDoHtmlProtocol:
+    def test_no_session_shows_error(self, app):
+        with patch("meeting_recorder.tray.time.sleep"):
+            app._do_html_protocol()
+        assert app.state == "idle"
+
+    def test_success(self, app, tmp_path):
+        session = _make_session(tmp_path, transcript=True)
+        app.cfg.output_dir = str(tmp_path)
+
+        with patch("meeting_recorder.transcriber.load_transcript", return_value={"segments": []}):
+            with patch("meeting_recorder.html_report.generate_html_protocol",
+                       return_value=session.html_protocol):
+                with patch("webbrowser.open"):
+                    with patch("meeting_recorder.tray.time.sleep"):
+                        app._do_html_protocol()
+
+        assert app.state == "idle"
+
+
+class TestRunHtmlFor:
+    def test_success(self, app, tmp_path):
+        session = _make_session(tmp_path, transcript=True)
+
+        with patch("meeting_recorder.transcriber.load_transcript", return_value={"segments": []}):
+            with patch("meeting_recorder.html_report.generate_html_protocol",
+                       return_value=session.html_protocol):
+                with patch("webbrowser.open"):
+                    with patch("meeting_recorder.tray.time.sleep"):
+                        app._run_html_for(session)
+
+        assert app.state == "idle"
+
+    def test_error_handled(self, app, tmp_path):
+        session = _make_session(tmp_path, transcript=True)
+
+        with patch("meeting_recorder.transcriber.load_transcript",
+                   side_effect=RuntimeError("не найден")):
+            with patch("meeting_recorder.tray.time.sleep"):
+                app._run_html_for(session)
+
+        assert app.state == "idle"

@@ -171,6 +171,13 @@ def create_app(cfg: AppConfig) -> Any:
                     "text": seg.get("text", "").strip(),
                 })
 
+        highlights: list[dict[str, Any]] = []
+        if paths.highlights.exists():
+            try:
+                highlights = json.loads(paths.highlights.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
         media = _pick_media(paths)
         media_url = f"/media/{session_id}/{media[0]}" if media else None
         media_type = media[1] if media else None
@@ -181,6 +188,7 @@ def create_app(cfg: AppConfig) -> Any:
             "summary_html": summary_html,
             "protocol_html": protocol_html,
             "transcript": transcript,
+            "highlights": highlights,
             "media_url": media_url,
             "media_type": media_type,
         })

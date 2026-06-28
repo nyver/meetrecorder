@@ -425,3 +425,131 @@ class TestMapReduceSummary:
         # Первый map-промпт содержит chunk_a, но не chunk_b
         assert "A" * 10 in received_prompts[0]
         assert "B" * 10 not in received_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# generate_highlights
+# ---------------------------------------------------------------------------
+
+class TestGenerateHighlights:
+    def _make_paths(self, tmp_path, session_id="meeting_2026-06-28_10-00-00"):
+        paths = SessionPaths(str(tmp_path), session_id)
+        paths.ensure_dir()
+        return paths
+
+    def _make_transcript(self):
+        return {
+            "language": "ru",
+            "duration_sec": 120.0,
+            "segments": [
+                {"start": float(i * 10), "end": float(i * 10 + 9),
+                 "speaker": "SPEAKER_00", "text": f"Текст сегмента {i}."}
+                for i in range(10)
+            ],
+        }
+
+    def _mock_client(self, response_text: str):
+        mock = MagicMock()
+        mock.__enter__ = MagicMock(return_value=mock)
+        mock.__exit__ = MagicMock(return_value=False)
+        mock.chat.return_value = response_text
+        return mock
+
+    def test_success(self, tmp_path):
+        from meeting_recorder.report import generate_highlights
+        cfg = AppConfig()
+        paths = self._make_paths(tmp_path)
+        transcript = self._make_transcript()
+
+        hl = [
+            {"title": f"Момент {i}", "description": "Описание", "start": float(i * 20)}
+            for i in range(5)
+        ]
+        mock_client = self._mock_client(json.dumps(hl, ensure_ascii=False))
+
+        with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
+            result = generate_highlights(transcript, paths, cfg)
+
+        assert result.exists()
+        saved = json.loads(result.read_text(encoding="utf-8"))
+        assert isinstance(saved, list)
+        assert saved[0]["title"] == "Момент 0"
+
+    def test_from_file(self, tmp_path):
+        from meeting_recorder.report import generate_highlights
+        cfg = AppConfig()
+        paths = self._make_paths(tmp_path)
+        transcript = self._make_transcript()
+        json_path = tmp_path / "t.json"
+        json_path.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+
+        hl = [{"title": "T", "description": "D", "start": 0.0}]
+        mock_client = self._mock_client(json.dumps(hl))
+
+        with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
+            result = generate_highlights(str(json_path), paths, cfg)
+        assert result.exists()
+
+    def test_strips_code_fences(self, tmp_path):
+        from meeting_recorder.report import generate_highlights
+        cfg = AppConfig()
+        paths = self._make_paths(tmp_path)
+        transcript = self._make_transcript()
+
+        hl = [{"title": "T", "description": "D", "start": 0.0}]
+        fenced = f"```json\n{json.dumps(hl)}\n```"
+        mock_client = self._mock_client(fenced)
+
+        with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
+            result = generate_highlights(transcript, paths, cfg)
+        assert result.exists()
+        saved = json.loads(result.read_text(encoding="utf-8"))
+        assert isinstance(saved, list)
+
+    def test_non_list_response_raises(self, tmp_path):
+        from meeting_recorder.report import generate_highlights
+        cfg = AppConfig()
+        paths = self._make_paths(tmp_path)
+        transcript = self._make_transcript()
+
+        mock_client = self._mock_client('{"error": "not a list"}')
+
+        with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="массив"):
+                generate_highlights(transcript, paths, cfg)
+
+    def test_speaker_names_substituted(self, tmp_path):
+        from meeting_recorder.report import generate_highlights
+        cfg = AppConfig()
+        cfg.transcription.speaker_names = {"SPEAKER_00": "Иван"}
+        paths = self._make_paths(tmp_path)
+        transcript = self._make_transcript()
+
+        captured: list[str] = []
+
+        def _chat(msgs):
+            captured.append(msgs[0]["content"])
+            return json.dumps([{"title": "T", "description": "D", "start": 0.0}])
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.chat.side_effect = _chat
+
+        with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
+            generate_highlights(transcript, paths, cfg)
+
+        assert "Иван" in captured[0]
+
+    def test_empty_segments(self, tmp_path):
+        from meeting_recorder.report import generate_highlights
+        cfg = AppConfig()
+        paths = self._make_paths(tmp_path)
+        transcript = {"language": "ru", "duration_sec": 0.0, "segments": []}
+
+        hl = [{"title": "T", "description": "D", "start": 0.0}]
+        mock_client = self._mock_client(json.dumps(hl))
+
+        with patch("meeting_recorder.llm_client.create_llm_client", return_value=mock_client):
+            result = generate_highlights(transcript, paths, cfg)
+        assert result.exists()

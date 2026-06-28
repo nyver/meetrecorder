@@ -2,6 +2,33 @@
 
 {% block title %}{{ meta.date }} {{ meta.time }} — Meeting Recorder{% endblock %}
 
+{% block extra_css %}
+.hl-list { display: flex; flex-direction: column; gap: 10px; padding: 4px 0; }
+.hl-item {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.hl-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.hl-num {
+  min-width: 22px; height: 22px;
+  background: #2563eb; color: #fff;
+  border-radius: 50%; font-size: .72rem; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.hl-title { flex: 1; font-weight: 700; font-size: .9rem; color: #0f172a; }
+.hl-ts {
+  border: none; background: #eff6ff; color: #2563eb;
+  border-radius: 6px; padding: 3px 10px;
+  font-size: .78rem; font-weight: 600; cursor: pointer;
+  white-space: nowrap; transition: background .15s;
+}
+.hl-ts:hover { background: #dbeafe; }
+.hl-desc { font-size: .85rem; color: #475569; line-height: 1.55; margin: 0; }
+{% endblock %}
+
 {% block header_extra %}
   <a href="/" class="btn btn-ghost btn-sm" style="margin-left:auto">← К списку</a>
 {% endblock %}
@@ -44,14 +71,18 @@
 {% endif %}
 
 {# ---- Вкладки ---- #}
-{% set first = "summary" if summary_html else ("protocol" if protocol_html else "transcript") %}
-{% set has_any = summary_html or protocol_html or transcript %}
+{% set first = "summary" if summary_html else ("highlights" if highlights else ("protocol" if protocol_html else "transcript")) %}
+{% set has_any = summary_html or highlights or protocol_html or transcript %}
 
 {% if has_any %}
 <div class="tabs">
   {% if summary_html %}
   <button class="tab-btn {% if first == 'summary' %}active{% endif %}"
           onclick="switchTab('summary', this)">📄 Summary</button>
+  {% endif %}
+  {% if highlights %}
+  <button class="tab-btn {% if first == 'highlights' %}active{% endif %}"
+          onclick="switchTab('highlights', this)">⭐ Ключевые моменты</button>
   {% endif %}
   {% if protocol_html %}
   <button class="tab-btn {% if first == 'protocol' %}active{% endif %}"
@@ -72,6 +103,25 @@
 {% if summary_html %}
 <div id="tab-summary" class="tab-panel {% if first == 'summary' %}active{% endif %} card md-content">
   {{ summary_html|safe }}
+</div>
+{% endif %}
+
+{# ---- Ключевые моменты ---- #}
+{% if highlights %}
+<div id="tab-highlights" class="tab-panel {% if first == 'highlights' %}active{% endif %} card"
+     style="padding: 16px 20px">
+  <div class="hl-list">
+    {% for h in highlights %}
+    <div class="hl-item">
+      <div class="hl-header">
+        <span class="hl-num">{{ loop.index }}</span>
+        <span class="hl-title">{{ h.title }}</span>
+        <button class="hl-ts" onclick="seek({{ h.start }})">▶ {{ h.start|ts }}</button>
+      </div>
+      <p class="hl-desc">{{ h.description }}</p>
+    </div>
+    {% endfor %}
+  </div>
 </div>
 {% endif %}
 
@@ -136,7 +186,6 @@ function filterTranscript(query) {
     var hit = !q || txt.indexOf(q) !== -1 || spk.indexOf(q) !== -1;
     el.style.display = hit ? '' : 'none';
 
-    // Подсветка совпадений в тексте
     var txEl = el.querySelector('.tx');
     if (txEl) {
       if (!q || txt.indexOf(q) === -1) {
@@ -174,6 +223,7 @@ function seek(t) {
   if (!p) return;
   p.currentTime = t;
   p.play();
+  p.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 {% if media_url and transcript %}
@@ -181,41 +231,12 @@ function seek(t) {
   var player = document.getElementById('player');
   if (!player) return;
 
-  var lastSeg = null;
-  var userScrolling = false;
-  var scrollTimer = null;
-
-  function pauseAutoScroll() {
-    userScrolling = true;
-    clearTimeout(scrollTimer);
-    scrollTimer = setTimeout(function () { userScrolling = false; }, 3000);
-  }
-
-  window.addEventListener('wheel',     pauseAutoScroll, { passive: true });
-  window.addEventListener('touchmove', pauseAutoScroll, { passive: true });
-  window.addEventListener('keydown', function (e) {
-    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].indexOf(e.key) !== -1) {
-      pauseAutoScroll();
-    }
-  });
-
   player.addEventListener('timeupdate', function () {
     var t = player.currentTime;
-    var active = null;
-
     document.querySelectorAll('.seg').forEach(function (el) {
       var on = t >= parseFloat(el.dataset.start) && t < parseFloat(el.dataset.end);
       el.classList.toggle('active', on);
-      if (on) active = el;
     });
-
-    var transcriptPanel = document.getElementById('tab-transcript');
-    var panelVisible = transcriptPanel && transcriptPanel.classList.contains('active');
-
-    if (active && active !== lastSeg && !userScrolling && panelVisible) {
-      active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    }
-    lastSeg = active;
   });
 }());
 {% endif %}

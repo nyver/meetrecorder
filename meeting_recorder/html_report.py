@@ -207,6 +207,13 @@ def generate_html_protocol(
     if paths.summary.exists():
         summary_html = _md_to_html(paths.summary.read_text(encoding="utf-8"))
 
+    highlights: list[dict] = []
+    if paths.highlights.exists():
+        try:
+            highlights = json.loads(paths.highlights.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Не удалось загрузить highlights: %s", exc)
+
     content = _render(
         session_id=paths.session_id,
         date_str=date_str,
@@ -216,6 +223,7 @@ def generate_html_protocol(
         unique_speakers=unique_speakers,
         media=media,
         summary_html=summary_html,
+        highlights=highlights,
     )
 
     paths.html_protocol.write_text(content, encoding="utf-8")
@@ -236,6 +244,7 @@ def _render(
     unique_speakers: list[str],
     media: tuple[str, str] | None,
     summary_html: str,
+    highlights: list[dict] | None = None,
 ) -> str:
 
     # --- медиаплеер ---
@@ -272,6 +281,32 @@ def _render(
         )
     else:
         summary_block = ""
+
+    # --- блок highlights ---
+    if highlights:
+        hl_items = []
+        for i, h in enumerate(highlights, 1):
+            t = float(h.get("start", 0))
+            ts = _format_timestamp(t)
+            title = html.escape(h.get("title", ""))
+            desc = html.escape(h.get("description", ""))
+            hl_items.append(
+                f'<div class="hl-item">'
+                f'<div class="hl-header">'
+                f'<span class="hl-num">{i}</span>'
+                f'<span class="hl-title">{title}</span>'
+                f'<button class="hl-ts" onclick="seek({t:.2f})">'
+                f'&#9654; {ts}</button>'
+                f'</div>'
+                f'<p class="hl-desc">{desc}</p>'
+                f'</div>'
+            )
+        highlights_block = (
+            '<details open><summary>&#11088; Ключевые моменты</summary>'
+            '<div class="hl-body">' + "".join(hl_items) + '</div></details>'
+        )
+    else:
+        highlights_block = ""
 
     # --- кнопки фильтра говорящих ---
     sp_buttons = "\n".join(
@@ -318,6 +353,7 @@ def _render(
         duration=html.escape(duration_fmt),
         player_html=player_html,
         summary_block=summary_block,
+        highlights_block=highlights_block,
         sp_buttons=sp_buttons,
         transcript_rows=transcript_rows,
         speakers_json=speakers_json,
@@ -333,40 +369,12 @@ def _render(
 _HIGHLIGHT_JS = """
 var _player = document.getElementById('player');
 if (_player) {
-  var _lastSeg = null;
-  var _userScrolling = false;
-  var _scrollPauseTimer = null;
-
-  /* Помечаем ручной скрол (wheel/touch/клавиши).
-     programmatic scrollIntoView эти события НЕ генерирует,
-     поэтому флаг не «застревает» в true после авто-скрола. */
-  function _pauseAutoScroll() {
-    _userScrolling = true;
-    clearTimeout(_scrollPauseTimer);
-    _scrollPauseTimer = setTimeout(function () { _userScrolling = false; }, 3000);
-  }
-  window.addEventListener('wheel', _pauseAutoScroll, {passive: true});
-  window.addEventListener('touchmove', _pauseAutoScroll, {passive: true});
-  window.addEventListener('keydown', function (e) {
-    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].indexOf(e.key) !== -1) {
-      _pauseAutoScroll();
-    }
-  });
-
   _player.addEventListener('timeupdate', function () {
     var t = _player.currentTime;
-    var active = null;
     document.querySelectorAll('.seg').forEach(function (el) {
       var s = parseFloat(el.dataset.start), e = parseFloat(el.dataset.end);
-      var on = t >= s && t < e;
-      el.classList.toggle('active', on);
-      if (on) active = el;
+      el.classList.toggle('active', t >= s && t < e);
     });
-    /* Скролим только при смене сегмента и только если пользователь не скролит вручную */
-    if (active && active !== _lastSeg && !_userScrolling) {
-      active.scrollIntoView({block: 'nearest', behavior: 'smooth'});
-    }
-    _lastSeg = active;
   });
 }
 """
@@ -409,6 +417,18 @@ summary{{cursor:pointer;user-select:none;font-size:.95rem;font-weight:600}}
 .md-table th,.md-table td{{border:1px solid #e2e8f0;padding:5px 10px;text-align:left;vertical-align:top}}
 .md-table th{{background:#edf2f7;font-weight:700}}
 .md-table tr:nth-child(even) td{{background:#f7fafc}}
+/* highlights */
+.hl-body{{margin-top:12px;display:flex;flex-direction:column;gap:10px}}
+.hl-item{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 14px}}
+.hl-header{{display:flex;align-items:center;gap:10px;margin-bottom:6px}}
+.hl-num{{min-width:22px;height:22px;background:#2563eb;color:#fff;border-radius:50%;
+         font-size:.72rem;font-weight:700;display:flex;align-items:center;justify-content:center}}
+.hl-title{{flex:1;font-weight:700;font-size:.9rem;color:#0f172a}}
+.hl-ts{{border:none;background:#eff6ff;color:#2563eb;border-radius:6px;
+        padding:3px 10px;font-size:.78rem;font-weight:600;cursor:pointer;
+        white-space:nowrap;transition:background .15s}}
+.hl-ts:hover{{background:#dbeafe}}
+.hl-desc{{font-size:.85rem;color:#475569;line-height:1.55;margin:0}}
 /* controls */
 .controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}}
 .search{{flex:1;min-width:180px;padding:7px 12px;border:1px solid #cbd5e0;
@@ -441,6 +461,8 @@ summary{{cursor:pointer;user-select:none;font-size:.95rem;font-weight:600}}
   <div class="player-box">{player_html}</div>
 
   {summary_block}
+
+  {highlights_block}
 
   <div class="controls">
     <input class="search" type="search" placeholder="Поиск по тексту…"

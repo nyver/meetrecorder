@@ -16,6 +16,7 @@ from meeting_recorder.pipeline import (
     run_report,
     run_transcribe_only,
     run_report_only,
+    run_highlights_only,
     run_process,
     run_html,
     PipelineError,
@@ -239,6 +240,30 @@ class TestRunHtml:
     def test_nonexistent_session_raises(self, app_cfg):
         with pytest.raises(FileNotFoundError):
             run_html(app_cfg, "meeting_2000-01-01_00-00-00")
+
+
+# ---------------------------------------------------------------------------
+# run_highlights_only
+# ---------------------------------------------------------------------------
+
+class TestRunHighlightsOnly:
+    def test_success(self, app_cfg, tmp_session):
+        _make_transcript(tmp_session.transcript, tmp_session.session_id)
+
+        with patch("meeting_recorder.pipeline.generate_highlights",
+                   return_value=tmp_session.highlights) as mock_hl:
+            result = run_highlights_only(app_cfg, tmp_session.session_id)
+
+        mock_hl.assert_called_once()
+        assert result == tmp_session.highlights
+
+    def test_missing_transcript_raises(self, app_cfg, tmp_session):
+        with pytest.raises(PipelineError, match="Транскрипт"):
+            run_highlights_only(app_cfg, tmp_session.session_id)
+
+    def test_nonexistent_session_raises(self, app_cfg):
+        with pytest.raises(FileNotFoundError):
+            run_highlights_only(app_cfg, "meeting_2000-01-01_00-00-00")
 
 
 class TestRunProcess:

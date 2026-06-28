@@ -187,6 +187,17 @@ class TrayApp:
                 enabled=(state == "idle"),
             ),
             pystray.MenuItem(
+                "⭐  Ключевые моменты (highlights)",
+                self._on_highlights,
+                enabled=(state == "idle"),
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "📋  Встречи",
+                pystray.Menu(self._build_sessions_items),
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
                 "📂  Открыть папку встреч",
                 self._on_open_folder,
             ),
@@ -405,14 +416,15 @@ class TrayApp:
     def _do_report_session(self) -> None:
         paths = self._pick_session(need_transcript=True, need_no_summary=True)
         if paths is None:
-            # fallback: последняя с транскриптом (перегенерация)
             paths = self._pick_session(need_transcript=True)
         if paths is None:
             self._set_state("error", "Нет сессии с транскриптом")
             time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
+        self._run_report_for(paths)
 
+    def _run_report_for(self, paths: SessionPaths) -> None:
         self._set_state("processing", f"Отчёт: {paths.session_id}…")
         t0 = time.monotonic()
         try:
@@ -437,6 +449,7 @@ class TrayApp:
         need_transcript: bool = False,
         need_no_transcript: bool = False,
         need_no_summary: bool = False,
+        need_no_highlights: bool = False,
     ) -> Optional[SessionPaths]:
         """Найти последнюю сессию, удовлетворяющую условиям."""
         for s in reversed(list_sessions(self.cfg.output_dir)):
@@ -448,6 +461,8 @@ class TrayApp:
                 continue
             if need_no_summary and s.summary.exists():
                 continue
+            if need_no_highlights and s.highlights.exists():
+                continue
             return s
         return None
 
@@ -457,35 +472,26 @@ class TrayApp:
         threading.Thread(target=self._do_mux, daemon=True, name="tray-mux").start()
 
     def _do_mux(self) -> None:
-        from .recorder import mux_video
-        from .naming import list_sessions
-
         sessions = list_sessions(self.cfg.output_dir)
-        if not sessions:
-            self._set_state("error", "Нет сессий для mux")
-            time.sleep(_ERROR_BRIEF_SECS)
-            self._set_state("idle")
-            return
-
-        # Ищем последнюю сессию с видео и mix-аудио
         paths = None
         for s in reversed(sessions):
             if s.video.exists() and s.mix_audio.exists() and not s.final_video.exists():
                 paths = s
                 break
-
         if paths is None:
-            # Если все уже смикшированы — берём последнюю у которой есть видео+аудио
             for s in reversed(sessions):
                 if s.video.exists() and s.mix_audio.exists():
                     paths = s
                     break
-
         if paths is None:
             self._set_state("error", "Нет сессии с видео и аудио")
             time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
+        self._run_mux_for(paths)
+
+    def _run_mux_for(self, paths: SessionPaths) -> None:
+        from .recorder import mux_video
 
         self._set_state("processing", f"Mux: {paths.session_id}…")
         t0 = time.monotonic()
@@ -507,16 +513,18 @@ class TrayApp:
         threading.Thread(target=self._do_html_protocol, daemon=True, name="tray-html").start()
 
     def _do_html_protocol(self) -> None:
-        import webbrowser
-        from .html_report import generate_html_protocol
-        from .transcriber import load_transcript
-
         paths = self._pick_session(need_transcript=True)
         if paths is None:
             self._set_state("error", "Нет сессии с транскриптом для HTML")
             time.sleep(_ERROR_BRIEF_SECS)
             self._set_state("idle")
             return
+        self._run_html_for(paths)
+
+    def _run_html_for(self, paths: SessionPaths) -> None:
+        import webbrowser
+        from .html_report import generate_html_protocol
+        from .transcriber import load_transcript
 
         self._set_state("processing", f"HTML-протокол: {paths.session_id}…")
         t0 = time.monotonic()
@@ -532,6 +540,174 @@ class TrayApp:
             self._set_state("error", str(exc)[:60])
         time.sleep(_STATUS_DISPLAY_SECS)
         self._set_state("idle")
+
+    def _on_highlights(self, icon, item) -> None:
+        if self.state != "idle":
+            return
+        threading.Thread(target=self._do_highlights, daemon=True, name="tray-highlights").start()
+
+    def _do_highlights(self) -> None:
+        paths = self._pick_session(need_transcript=True, need_no_highlights=True)
+        if paths is None:
+            paths = self._pick_session(need_transcript=True)
+        if paths is None:
+            self._set_state("error", "Нет сессии с транскриптом")
+            time.sleep(_ERROR_BRIEF_SECS)
+            self._set_state("idle")
+            return
+        self._run_highlights_for(paths)
+
+    def _run_highlights_for(self, paths: SessionPaths) -> None:
+        self._set_state("processing", f"Ключевые моменты: {paths.session_id}…")
+        t0 = time.monotonic()
+        try:
+            from .report import generate_highlights
+            from .transcriber import load_transcript
+
+            data = load_transcript(paths.transcript)
+            highlights_path = generate_highlights(data, paths, self.cfg)
+            logger.info(
+                "Ключевые моменты сгенерированы за %s: %s",
+                _fmt_elapsed(time.monotonic() - t0), highlights_path.name,
+            )
+            self._notify("Meeting Recorder", f"Готово: {highlights_path.name}")
+            self._set_state("idle", "Ключевые моменты готовы")
+        except Exception as exc:
+            logger.error(
+                "Ошибка генерации ключевых моментов за %s: %s",
+                _fmt_elapsed(time.monotonic() - t0), exc,
+            )
+            self._set_state("error", str(exc)[:60])
+        time.sleep(_STATUS_DISPLAY_SECS)
+        self._set_state("idle")
+
+    # ------------------------------------------------------------------
+    # Меню "Встречи" — перегенерация артефактов для любой сессии
+    # ------------------------------------------------------------------
+
+    def _brief_summary(self, paths: SessionPaths) -> list[str]:
+        """Извлечь 3–4 строки из раздела 'Краткое резюме' summary-файла."""
+        if not paths.summary.exists():
+            return []
+        try:
+            text = paths.summary.read_text(encoding="utf-8")
+            in_section = False
+            raw: list[str] = []
+            for line in text.splitlines():
+                s = line.strip()
+                if s.startswith("#") and "резюме" in s.lower():
+                    in_section = True
+                    continue
+                if in_section:
+                    if s.startswith("#") or s.startswith("---"):
+                        break
+                    if s and not s.startswith("**"):
+                        raw.append(s)
+
+            # Word-wrap каждой строки до 68 символов, не более 4 строк итого
+            result: list[str] = []
+            max_w = 68
+            for sentence in raw:
+                if len(result) >= 4:
+                    break
+                if len(sentence) <= max_w:
+                    result.append(sentence)
+                else:
+                    words = sentence.split()
+                    current = ""
+                    for word in words:
+                        if len(result) >= 4:
+                            break
+                        if current and len(current) + 1 + len(word) > max_w:
+                            result.append(current)
+                            current = word
+                        else:
+                            current = (current + " " + word).strip()
+                    if current and len(result) < 4:
+                        result.append(current[:max_w] + "…" if len(current) > max_w else current)
+
+            return result
+        except Exception:
+            return []
+
+    def _fmt_session_label(self, paths: SessionPaths) -> str:
+        try:
+            parts = paths.session_id.split("_")
+            date = parts[1]
+            t = parts[2].replace("-", ":")
+            suffix = f"  #{parts[3]}" if len(parts) > 3 else ""
+            return f"{date}  {t}{suffix}"
+        except Exception:
+            return paths.session_id
+
+    def _build_session_submenu(self, paths: SessionPaths):
+        import pystray as _pt
+
+        def _items():
+            idle = self.state == "idle"
+            has_mix = paths.mix_audio.exists()
+            has_transcript = paths.transcript.exists()
+            has_video_audio = paths.video.exists() and paths.mix_audio.exists()
+
+            def _run(fn, tname):
+                def cb(icon, item):
+                    if self.state == "idle":
+                        threading.Thread(target=fn, daemon=True, name=tname).start()
+                return cb
+
+            items: list = []
+
+            # Краткое саммари встречи (если есть)
+            for line in self._brief_summary(paths):
+                items.append(_pt.MenuItem(f"  {line}", None, enabled=False))
+            if items:
+                items.append(_pt.Menu.SEPARATOR)
+
+            items += [
+                _pt.MenuItem(
+                    "⚙️  Транскрипция + отчёт",
+                    _run(lambda: self._do_process(paths), "ses-process"),
+                    enabled=idle and has_mix,
+                ),
+                _pt.MenuItem(
+                    "📝  Перегенерировать отчёт",
+                    _run(lambda: self._run_report_for(paths), "ses-report"),
+                    enabled=idle and has_transcript,
+                ),
+                _pt.MenuItem(
+                    "⭐  Ключевые моменты",
+                    _run(lambda: self._run_highlights_for(paths), "ses-hl"),
+                    enabled=idle and has_transcript,
+                ),
+                _pt.MenuItem(
+                    "🌐  HTML-протокол",
+                    _run(lambda: self._run_html_for(paths), "ses-html"),
+                    enabled=idle and has_transcript,
+                ),
+                _pt.MenuItem(
+                    "🎬  Mux видео + аудио",
+                    _run(lambda: self._run_mux_for(paths), "ses-mux"),
+                    enabled=idle and has_video_audio,
+                ),
+            ]
+            return items
+
+        return _pt.Menu(_items)
+
+    def _build_sessions_items(self):
+        import pystray as _pt
+
+        sessions = list(reversed(list_sessions(self.cfg.output_dir)))[:25]
+        if not sessions:
+            return [_pt.MenuItem("  (нет сессий)", None, enabled=False)]
+
+        return [
+            _pt.MenuItem(
+                self._fmt_session_label(s),
+                self._build_session_submenu(s),
+            )
+            for s in sessions
+        ]
 
     def _on_open_last_session_folder(self, icon, item) -> None:
         with self._lock:
