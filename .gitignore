@@ -42,3 +42,5 @@ sample/*.mp4
 .qwen
 .venv
 .coverage
+.pytest-tmp*/
+.meeting_recorder_state/

@@ -335,6 +335,31 @@ class TestCompatPatches:
         _patch_torch_load_compat()
         _patch_torch_load_compat()
 
+    def test_patch_torch_load_preserves_explicit_weights_only(self):
+        import torch
+
+        original = torch.load
+        calls = []
+
+        def fake_load(*args, **kwargs):
+            calls.append(kwargs.copy())
+            return object()
+
+        torch.load = fake_load
+        if hasattr(torch, "_patched_weights_only"):
+            delattr(torch, "_patched_weights_only")
+        try:
+            _patch_torch_load_compat()
+            torch.load("model.pt", weights_only=True)
+            torch.load("model.pt")
+        finally:
+            torch.load = original
+            if hasattr(torch, "_patched_weights_only"):
+                delattr(torch, "_patched_weights_only")
+
+        assert calls[0]["weights_only"] is True
+        assert calls[1]["weights_only"] is False
+
     def test_patch_speechbrain_lazy_module_no_speechbrain(self):
         with patch.dict("sys.modules", {"speechbrain": None, "speechbrain.utils": None,
                                          "speechbrain.utils.importutils": None}):

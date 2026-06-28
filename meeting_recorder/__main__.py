@@ -33,13 +33,26 @@ logger = logging.getLogger("meeting_recorder")
 
 def _default_state_dir() -> Path:
     """Вернуть user-writable директорию для файлов состояния."""
+    override = os.environ.get("MEETING_RECORDER_STATE_DIR")
+    if override:
+        return Path(override)
+
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
     else:
         xdg = os.environ.get("XDG_RUNTIME_DIR")
         base = Path(xdg) if xdg else Path.home() / ".local" / "share"
-    return base / "MeetingRecorder" / ".state"
+    candidate = base / "MeetingRecorder" / ".state"
+
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write_test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return candidate
+    except OSError:
+        return Path.cwd() / ".meeting_recorder_state"
 
 
 _STATE_DIR = _default_state_dir()
@@ -209,41 +222,40 @@ def start(ctx):
     from meeting_recorder.naming import create_session
     from meeting_recorder.recorder import MeetingRecorder
 
-    paths = create_session(cfg.output_dir)
-    recorder = MeetingRecorder(cfg, paths)
-
-    _STOP_FILE.unlink(missing_ok=True)
-    _DONE_FILE.unlink(missing_ok=True)
-
+    recorder = None
     try:
+        _ensure_state_dir()
+        _STOP_FILE.unlink(missing_ok=True)
+        _DONE_FILE.unlink(missing_ok=True)
+
+        paths = create_session(cfg.output_dir)
+        recorder = MeetingRecorder(cfg, paths)
         recorder.start()
-    except Exception as exc:
-        logger.error("Ошибка запуска записи: %s", exc)
-        print(f"\n❌ Ошибка запуска записи: {exc}\n")
-        return
 
-    ffmpeg_pid = recorder.ffmpeg_pid
+        ffmpeg_pid = recorder.ffmpeg_pid
+        _save_state(paths.session_id, str(paths.video), ffmpeg_pid)
+        logger.info("Запись начата: %s (ffmpeg PID=%s)", paths.session_id, ffmpeg_pid)
+        print(f"\n✅ Запись начата: {paths.session_id}")
+        print(f"   Папка: {paths.dir}")
+        print(f"   Остановить: mrec stop  (или Ctrl+C)\n")
 
-    _save_state(paths.session_id, str(paths.video), ffmpeg_pid)
-    logger.info("Запись начата: %s (ffmpeg PID=%s)", paths.session_id, ffmpeg_pid)
-    print(f"\n✅ Запись начата: {paths.session_id}")
-    print(f"   Папка: {paths.dir}")
-    print(f"   Остановить: mrec stop  (или Ctrl+C)\n")
-
-    # Блокируем до получения сигнала остановки
-    try:
+        # Блокируем до получения сигнала остановки
         while not _STOP_FILE.exists():
             time.sleep(0.5)
         logger.info("Stop-сигнал получен — останавливаю запись")
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt — останавливаю запись")
+    except Exception as exc:
+        logger.error("Ошибка запуска записи: %s", exc)
+        print(f"\n❌ Ошибка запуска записи: {exc}\n")
     finally:
         # Останавливаем ffmpeg И soundcard-захват, ждём сохранения файлов
-        recorder.stop()
-        _DONE_FILE.touch()
+        if recorder is not None:
+            recorder.stop()
+            _DONE_FILE.touch()
+            logger.info("Запись завершена: %s", paths.session_id)
         _STOP_FILE.unlink(missing_ok=True)
         _remove_state()
-        logger.info("Запись завершена: %s", paths.session_id)
 
 
 def _signal_stop_and_wait(ffmpeg_pid: int | None) -> None:

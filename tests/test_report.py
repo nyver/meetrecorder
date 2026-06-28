@@ -95,7 +95,8 @@ class TestSplitTextIntoChunks:
     def test_single_paragraph_larger_than_limit(self):
         big_para = "x" * 1000
         chunks = _split_text_into_chunks(big_para, max_chars=100)
-        assert len(chunks) == 1  # не можем разбить по абзацам, один чанк
+        assert len(chunks) == 10
+        assert all(len(chunk) <= 100 for chunk in chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +417,8 @@ class TestMapReduceSummary:
         chunk_b = "B" * 100
         full_text = f"{chunk_a}\n\n{chunk_b}"
 
-        # Уменьшаем лимит контекста (150 слов → ~115 символов чанк) чтобы текст разбился на 2 чанка
-        with patch.object(report_mod, "_CONTEXT_TOKEN_LIMIT", 150):
+        # Уменьшаем лимит контекста, чтобы текст разбился на 2 чанка.
+        with patch.object(report_mod, "_CONTEXT_TOKEN_LIMIT", 50):
             _map_reduce_summary(full_text, self._TEMPLATE, self._META, cfg=cfg, client=mock_client)
 
         # 2 map-промпта + 1 reduce = минимум 3 вызова

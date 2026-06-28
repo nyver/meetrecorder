@@ -138,7 +138,7 @@ def _clean_protocol(protocol_text: str, cfg: AppConfig) -> str:
 # ---------------------------------------------------------------------------
 
 _CONTEXT_TOKEN_LIMIT = 120_000  # примерный лимит для 70B-моделей
-_WORDS_PER_TOKEN = 1.3
+_CHARS_PER_TOKEN = 4
 
 
 def _fill_template(template: str, meta: dict, transcript_text: str) -> str:
@@ -180,7 +180,7 @@ def generate_summary(
         ts = _format_timestamp(seg["start"])
         lines.append(f"[{ts}] {sp}: {seg.get('text', '').strip()}")
     full_text = "\n".join(lines)
-    est_tokens = len(full_text.split()) * _WORDS_PER_TOKEN
+    est_tokens = max(len(full_text) // _CHARS_PER_TOKEN, len(full_text.split()))
 
     meeting_dt = _session_datetime(paths.session_id)
     duration_min = data.get("duration_sec", 0) / 60.0
@@ -234,7 +234,8 @@ def _map_reduce_summary(
     client: "LLMClient",
 ) -> str:
     """Map-reduce: разбить на чанки → промежуточные резюме → агрегация."""
-    chunk_size = int(_CONTEXT_TOKEN_LIMIT / _WORDS_PER_TOKEN)
+    # Оставляем запас под prompt template и ответ модели.
+    chunk_size = int(_CONTEXT_TOKEN_LIMIT * _CHARS_PER_TOKEN * 0.75)
     chunks = _split_text_into_chunks(full_text, chunk_size)
 
     # Map: каждый чанк форматируется своим промптом через тот же шаблон
@@ -344,12 +345,25 @@ def generate_highlights(
 
 def _split_text_into_chunks(text: str, max_chars: int) -> list[str]:
     """Разбить текст на чанки не больше max_chars, разрывая по абзацам."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+
     chunks = []
     current = []
     current_len = 0
 
     for para in text.split("\n\n"):
         para_len = len(para)
+        if para_len > max_chars:
+            if current:
+                chunks.append("\n\n".join(current))
+                current = []
+                current_len = 0
+            chunks.extend(
+                para[start:start + max_chars]
+                for start in range(0, para_len, max_chars)
+            )
+            continue
         if current_len + para_len > max_chars and current:
             chunks.append("\n\n".join(current))
             current = [para]

@@ -70,16 +70,22 @@ class SystemAudioCapture:
             loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
             logger.info("Захват системного аудио: %s", speaker.name)
 
-            chunks: list[np.ndarray] = []
+            frames_written = 0
             with loopback.recorder(samplerate=self._sr, channels=1, blocksize=self._chunk_frames) as rec:
-                while not self._stop_event.is_set():
-                    chunk = rec.record(numframes=self._chunk_frames)
-                    chunks.append(chunk)
+                with sf.SoundFile(
+                    str(self._path),
+                    mode="w",
+                    samplerate=self._sr,
+                    channels=1,
+                    subtype="PCM_16",
+                ) as out:
+                    while not self._stop_event.is_set():
+                        chunk = rec.record(numframes=self._chunk_frames)
+                        out.write(chunk)
+                        frames_written += len(chunk)
 
-            if chunks:
-                audio = np.concatenate(chunks)
-                sf.write(str(self._path), audio, self._sr, subtype="PCM_16")
-                logger.info("Системный звук сохранён: %s (%.1f сек)", self._path, len(audio) / self._sr)
+            if frames_written:
+                logger.info("Системный звук сохранён: %s (%.1f сек)", self._path, frames_written / self._sr)
             else:
                 logger.warning("Системный звук: нет данных")
         except Exception as exc:

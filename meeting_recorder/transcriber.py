@@ -120,7 +120,8 @@ def _patch_hf_use_auth_token() -> None:
 def _patch_torch_load_compat() -> None:
     """PyTorch 2.6+ сменил weights_only=True по умолчанию — pyannote чекпоинты не грузятся.
 
-    Патчим torch.load глобально: устанавливаем weights_only=False по умолчанию.
+    Патчим torch.load глобально: устанавливаем weights_only=False только если вызывающий код
+    не передал weights_only явно.
     pl_load в pyannote — прямая ссылка, поэтому патчить cloud_io бесполезно.
 
     БЕЗОПАСНОСТЬ: weights_only=False допускает выполнение произвольного кода при загрузке
@@ -136,7 +137,7 @@ def _patch_torch_load_compat() -> None:
         _orig_load = torch.load
 
         def _patched_load(*args, **kwargs):
-            kwargs["weights_only"] = False
+            kwargs.setdefault("weights_only", False)
             return _orig_load(*args, **kwargs)
 
         torch.load = _patched_load
