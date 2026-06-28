@@ -134,6 +134,11 @@ def create_app(cfg: AppConfig) -> Any:
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
 
+        # Защита от path traversal (аналогично /media/)
+        safe_root = Path(cfg.output_dir).resolve()
+        if not paths.dir.resolve().is_relative_to(safe_root):
+            raise HTTPException(status_code=403)
+
         meta = _session_meta(paths, cfg)
 
         summary_html = (

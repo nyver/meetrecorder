@@ -323,12 +323,14 @@ def generate_highlights(
         response = client.chat([{"role": "user", "content": prompt}])
 
     response = response.strip()
+    if not response:
+        raise ValueError("LLM вернул пустой ответ для highlights")
     if response.startswith("```"):
         response = "\n".join(
             line for line in response.split("\n") if not line.startswith("```")
-        )
+        ).strip()
 
-    highlights = _json.loads(response.strip())
+    highlights = _json.loads(response)
     if not isinstance(highlights, list):
         raise ValueError("LLM вернул не массив для highlights")
 

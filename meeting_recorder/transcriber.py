@@ -203,10 +203,15 @@ def _get_diarization_model(cfg: AppConfig):
             return None
 
         logger.info("Загрузка pyannote.pipeline (device=%s)…", cfg.transcription.device)
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token,
-        )
+        try:
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token,
+            )
+        except Exception as e:
+            logger.warning("Не удалось загрузить pyannote pipeline: %s", e)
+            _model_cache[key] = None  # кэшируем None, чтобы не повторять попытку
+            return None
         try:
             import torch
             pipeline.to(torch.device(cfg.transcription.device))

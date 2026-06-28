@@ -140,7 +140,10 @@ def run_report(
             f"Транскрипт не найден: {transcript}. Сначала выполните транскрипцию."
         )
 
-    data = transcriber_load_transcript(transcript)
+    try:
+        data = transcriber_load_transcript(transcript)
+    except Exception as exc:
+        raise PipelineError(f"Не удалось прочитать транскрипт: {exc}") from exc
 
     protocol_path = generate_protocol(data, paths, cfg)
     summary_path = generate_summary(data, paths, cfg)
@@ -172,7 +175,10 @@ def run_html(
             f"Транскрипт не найден: {paths.transcript}. Сначала выполните транскрипцию."
         )
 
-    data = transcriber_load_transcript(paths.transcript)
+    try:
+        data = transcriber_load_transcript(paths.transcript)
+    except Exception as exc:
+        raise PipelineError(f"Не удалось прочитать транскрипт: {exc}") from exc
     return generate_html_protocol(data, paths, cfg)
 
 
@@ -263,7 +269,10 @@ def run_highlights_only(cfg: AppConfig, session_id: str) -> Path:
         raise PipelineError(
             f"Транскрипт не найден: {paths.transcript}. Сначала выполните транскрипцию."
         )
-    data = transcriber_load_transcript(paths.transcript)
+    try:
+        data = transcriber_load_transcript(paths.transcript)
+    except Exception as exc:
+        raise PipelineError(f"Не удалось прочитать транскрипт: {exc}") from exc
     return generate_highlights(data, paths, cfg)
 
 

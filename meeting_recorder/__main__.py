@@ -377,10 +377,10 @@ def stop(ctx):
         return
 
     # Запускаем пайплайн
-    print("\n🚀 Запускаю пайплайн: транскрипция → протокол → summary…\n")
+    print("\n🚀 Запускаю пайплайн: транскрипция → протокол → summary → highlights → HTML…\n")
     try:
         from meeting_recorder.transcriber import transcribe
-        from meeting_recorder.report import generate_protocol, generate_summary
+        from meeting_recorder.pipeline import run_report
 
         # Транскрипция
         print("📝 Транскрипция…")
@@ -396,17 +396,13 @@ def stop(ctx):
         )
         logger.info("Транскрипция завершена: %s (%d сегментов)", paths.transcript, len(result["segments"]))
 
-        # Протокол
-        print("📋 Протокол…")
-        generate_protocol(result, paths, cfg)
-
-        # Summary
-        print("📄 Summary…")
-        generate_summary(result, paths, cfg)
+        # Протокол + Summary + Highlights + HTML
+        print("📋 Отчёт…")
+        protocol_path, summary_path = run_report(cfg, paths)
 
         print(f"\n✅ Готово! Артефакты в: {paths.dir}")
-        print(f"   Протокол: {paths.protocol}")
-        print(f"   Summary:  {paths.summary}")
+        print(f"   Протокол: {protocol_path}")
+        print(f"   Summary:  {summary_path}")
 
     except Exception as e:
         logger.error("Ошибка пайплайна: %s", e, exc_info=True)

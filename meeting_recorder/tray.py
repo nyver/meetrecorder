@@ -313,6 +313,13 @@ class TrayApp:
             name="tray-process",
         ).start()
 
+    def _do_stop_blocking(self) -> None:
+        """Остановить запись и дождаться полной обработки (для _on_exit)."""
+        paths = self._do_stop_and_mix()
+        if paths is None:
+            return
+        self._do_process(paths)  # выполняем в текущем потоке, без daemon
+
     def _do_stop_only(self) -> None:
         paths = self._do_stop_and_mix()
         if paths is None:
@@ -326,7 +333,7 @@ class TrayApp:
         t0 = time.monotonic()
         try:
             from .transcriber import transcribe
-            from .report import generate_protocol, generate_summary
+            from .pipeline import run_report
 
             self._set_state("processing", "Транскрипция…")
             t_tr = time.monotonic()
@@ -340,8 +347,7 @@ class TrayApp:
 
             self._set_state("processing", "Генерирую отчёт…")
             t_rep = time.monotonic()
-            generate_protocol(result, paths, self.cfg)
-            generate_summary(result, paths, self.cfg)
+            run_report(self.cfg, paths)
             logger.info("Отчёт сгенерирован за %s", _fmt_elapsed(time.monotonic() - t_rep))
 
             logger.info("Обработка завершена за %s: %s", _fmt_elapsed(time.monotonic() - t0), paths.session_id)
@@ -432,12 +438,8 @@ class TrayApp:
         self._set_state("processing", f"Отчёт: {paths.session_id}…")
         t0 = time.monotonic()
         try:
-            from .report import generate_protocol, generate_summary
-            from .transcriber import load_transcript
-
-            data = load_transcript(paths.transcript)
-            generate_protocol(data, paths, self.cfg)
-            generate_summary(data, paths, self.cfg)
+            from .pipeline import run_report
+            run_report(self.cfg, paths)
             logger.info("Отчёт сгенерирован за %s: %s", _fmt_elapsed(time.monotonic() - t0), paths.session_id)
             self._notify("Meeting Recorder", f"Отчёт готов: {paths.session_id}")
             self._set_state("idle", "Отчёт готов")
@@ -737,10 +739,11 @@ class TrayApp:
 
     def _on_exit(self, icon, item) -> None:
         if self.state == "recording":
-            # Не-daemon тред: дожидаемся штатного завершения ffmpeg до выхода
-            t = threading.Thread(target=self._do_stop, daemon=False, name="tray-exit-stop")
+            # Не-daemon тред: дожидаемся остановки записи И полной обработки до выхода.
+            # _do_stop_blocking выполняет stop+mix+process в одном потоке.
+            t = threading.Thread(target=self._do_stop_blocking, daemon=False, name="tray-exit-stop")
             t.start()
-            t.join(timeout=30)  # recorder.stop() может занимать до ~25 сек
+            t.join(timeout=1800)  # до 30 мин: остановка + транскрипция + отчёт
         icon.stop()
 
     # ------------------------------------------------------------------

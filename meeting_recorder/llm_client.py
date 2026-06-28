@@ -76,7 +76,12 @@ class LLMClient:
             raise LLMClientError(f"Таймаут запроса к LLM: {e}") from e
 
         data = response.json()
-        choice = data["choices"][0]
+        choices = data.get("choices", [])
+        if not choices:
+            raise LLMClientError(
+                f"LLM вернул пустой список choices: {data}"
+            )
+        choice = choices[0]
         message = choice.get("message", {})
         content = message.get("content") or ""
 
