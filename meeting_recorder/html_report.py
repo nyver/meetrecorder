@@ -12,7 +12,7 @@ from typing import Any
 from .config import AppConfig
 from .naming import SessionPaths
 from .report import _format_timestamp, _session_datetime
-from .transcriber import load_transcript
+from .session_utils import load_transcript_data, normalize_segments, pick_media
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +39,7 @@ def _pick_media(paths: SessionPaths) -> tuple[str, str] | None:
     Сырое видео gdigrab не содержит аудио, поэтому mix_audio предпочтительнее.
     Возвращает (filename, mime_type) или None.
     """
-    if paths.final_video.exists():
-        return paths.final_video.name, "video/mp4"
-    if paths.mix_audio.exists():
-        return paths.mix_audio.name, "audio/wav"
-    if paths.video.exists():
-        return paths.video.name, "video/mp4"
-    return None
+    return pick_media(paths, mime=True)
 
 
 def _is_sep_row(line: str) -> bool:
@@ -165,24 +159,12 @@ def generate_html_protocol(
     Returns:
         Путь к сохранённому *_protocol.html.
     """
-    if isinstance(transcript, (Path, str)):
-        data = load_transcript(transcript)
-    else:
-        data = transcript
+    data = load_transcript_data(transcript)
 
     raw_segs = data.get("segments", [])
-    speaker_names = cfg.transcription.speaker_names
 
     # Применяем переименование говорящих
-    segments: list[dict[str, Any]] = []
-    for seg in raw_segs:
-        spk = seg.get("speaker", "UNKNOWN")
-        segments.append({
-            "start": seg["start"],
-            "end":   seg["end"],
-            "speaker": speaker_names.get(spk, spk),
-            "text":  seg.get("text", "").strip(),
-        })
+    segments = normalize_segments(raw_segs, cfg.transcription.speaker_names)
 
     unique_speakers = sorted({s["speaker"] for s in segments})
     colors = _color_map(unique_speakers)

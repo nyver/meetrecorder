@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw
 from .config import AppConfig
 from .naming import SessionPaths, create_session, list_sessions
 from .recorder import MeetingRecorder, mix_audio_files
+from .session_utils import save_transcript_data
 
 logger = logging.getLogger(__name__)
 
@@ -339,10 +340,7 @@ class TrayApp:
             t_tr = time.monotonic()
             result = transcribe(paths.mix_audio, self.cfg, output_path=paths.transcript)
             result["session_id"] = paths.session_id
-            paths.transcript.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            save_transcript_data(paths.transcript, result)
             logger.info("Транскрипция завершена за %s", _fmt_elapsed(time.monotonic() - t_tr))
 
             self._set_state("processing", "Генерирую отчёт…")

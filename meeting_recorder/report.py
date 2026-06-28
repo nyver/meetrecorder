@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
 from .naming import SessionPaths
-from .transcriber import load_transcript
+from .session_utils import (
+    load_transcript_data,
+    normalize_segments,
+    strip_code_fences,
+    transcript_lines,
+    unique_speakers as _unique_speakers,
+)
 
 if TYPE_CHECKING:
     from .llm_client import LLMClient
@@ -51,24 +57,10 @@ def generate_protocol(
     Returns:
         Путь к сохранённому *_protocol.md.
     """
-    if isinstance(transcript, (Path, str)):
-        data = load_transcript(transcript)
-    else:
-        data = transcript
+    data = load_transcript_data(transcript)
 
     # Применяем имена говорящих
-    speaker_names = cfg.transcription.speaker_names
-    segments = []
-    for seg in data.get("segments", []):
-        speaker = seg.get("speaker", "UNKNOWN")
-        if speaker in speaker_names:
-            speaker = speaker_names[speaker]
-        segments.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "speaker": speaker,
-            "text": seg["text"],
-        })
+    segments = normalize_segments(data.get("segments", []), cfg.transcription.speaker_names)
 
     # Формируем Markdown
     date_str = _session_datetime(paths.session_id).strftime("%Y-%m-%d %H:%M")
@@ -124,13 +116,7 @@ def _clean_protocol(protocol_text: str, cfg: AppConfig) -> str:
         return protocol_text
 
     # Убираем возможные маркеры markdown-кода, если LLM их добавил
-    cleaned = cleaned.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
-        cleaned = "\n".join(lines)
-
-    return cleaned
+    return strip_code_fences(cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -166,25 +152,20 @@ def generate_summary(
 
     Реализует chunking + map-reduce для длинных встреч.
     """
-    if isinstance(transcript, (Path, str)):
-        data = load_transcript(transcript)
-    else:
-        data = transcript
+    data = load_transcript_data(transcript)
 
     segments = data.get("segments", [])
-    speaker_names = cfg.transcription.speaker_names
-    lines: list[str] = []
-    for seg in segments:
-        sp = seg.get("speaker", "UNKNOWN")
-        sp = speaker_names.get(sp, sp)
-        ts = _format_timestamp(seg["start"])
-        lines.append(f"[{ts}] {sp}: {seg.get('text', '').strip()}")
+    lines = transcript_lines(
+        segments,
+        speaker_names=cfg.transcription.speaker_names,
+        timestamp_formatter=_format_timestamp,
+    )
     full_text = "\n".join(lines)
     est_tokens = max(len(full_text) // _CHARS_PER_TOKEN, len(full_text.split()))
 
     meeting_dt = _session_datetime(paths.session_id)
     duration_min = data.get("duration_sec", 0) / 60.0
-    unique_speakers = sorted({seg.get("speaker", "UNKNOWN") for seg in segments})
+    unique_speakers = _unique_speakers(segments, cfg.transcription.speaker_names)
 
     # Метаданные передаём отдельным словарём — шаблон форматируется per-chunk в map-reduce
     meta = {
@@ -303,18 +284,13 @@ def generate_highlights(
 
     from .llm_client import create_llm_client
 
-    if isinstance(transcript, (Path, str)):
-        data = load_transcript(transcript)
-    else:
-        data = transcript
+    data = load_transcript_data(transcript)
 
-    speaker_names = cfg.transcription.speaker_names
-    lines: list[str] = []
-    for seg in data.get("segments", []):
-        sp = seg.get("speaker", "?")
-        sp = speaker_names.get(sp, sp)
-        ts = _format_timestamp(seg["start"])
-        lines.append(f"[{ts}] {sp}: {seg.get('text', '').strip()}")
+    lines = transcript_lines(
+        data.get("segments", []),
+        speaker_names=cfg.transcription.speaker_names,
+        timestamp_formatter=_format_timestamp,
+    )
 
     transcript_text = "\n".join(lines)
     template = (_PROMPTS_DIR / "highlights.md").read_text(encoding="utf-8")
@@ -323,14 +299,9 @@ def generate_highlights(
     with create_llm_client(cfg.llm) as client:
         response = client.chat([{"role": "user", "content": prompt}])
 
-    response = response.strip()
+    response = strip_code_fences(response)
     if not response:
         raise ValueError("LLM вернул пустой ответ для highlights")
-    if response.startswith("```"):
-        response = "\n".join(
-            line for line in response.split("\n") if not line.startswith("```")
-        ).strip()
-
     highlights = _json.loads(response)
     if not isinstance(highlights, list):
         raise ValueError("LLM вернул не массив для highlights")

@@ -23,6 +23,7 @@ import click
 from meeting_recorder.config import AppConfig, load_config
 from meeting_recorder.naming import list_sessions, resolve_session
 from meeting_recorder.pipeline import PipelineError, run_highlights_only, run_html, run_process, run_report_only, run_transcribe_only
+from meeting_recorder.session_utils import save_transcript_data
 
 logger = logging.getLogger("meeting_recorder")
 
@@ -402,10 +403,7 @@ def stop(ctx):
             output_path=paths.transcript,
         )
         result["session_id"] = paths.session_id
-        paths.transcript.write_text(
-            json.dumps(result, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_transcript_data(paths.transcript, result)
         logger.info("Транскрипция завершена: %s (%d сегментов)", paths.transcript, len(result["segments"]))
 
         # Протокол + Summary + Highlights + HTML

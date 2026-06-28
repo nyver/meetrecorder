@@ -2,24 +2,68 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from .config import AppConfig
-from .llm_client import LLMClientError
-from .naming import SessionPaths, create_session, list_sessions, resolve_session
+from .naming import SessionPaths, create_session, resolve_session
 from .recorder import MeetingRecorder, mix_audio_files
 from .html_report import generate_html_protocol
 from .report import generate_highlights, generate_protocol, generate_summary
+from .session_utils import load_transcript_data, save_transcript_data
 from .transcriber import transcribe
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 class PipelineError(Exception):
     """Ошибка пайплайна."""
+
+
+def _ffprobe_duration(path: Path) -> float:
+    """Return media duration in seconds using ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return 0.0
+    info = json.loads(result.stdout)
+    return float(info.get("format", {}).get("duration", 0))
+
+
+def _run_optional_step(description: str, func: Callable[[], T]) -> T | None:
+    try:
+        return func()
+    except Exception as exc:
+        logger.warning("%s: %s", description, exc)
+        return None
+
+
+def _load_existing_transcript(paths: SessionPaths) -> dict[str, Any]:
+    if not paths.transcript.exists():
+        raise PipelineError(
+            f"Транскрипт не найден: {paths.transcript}. Сначала выполните транскрипцию."
+        )
+    try:
+        return load_transcript_data(paths.transcript)
+    except Exception as exc:
+        raise PipelineError(f"Не удалось прочитать транскрипт: {exc}") from exc
 
 
 def _check_video_length(paths: "SessionPaths") -> None:
@@ -27,22 +71,8 @@ def _check_video_length(paths: "SessionPaths") -> None:
     if not paths.video.exists() or not paths.mic_audio.exists():
         return
     try:
-        import subprocess, json as _json
-        r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", "-show_format", str(paths.video)],
-            capture_output=True, text=True, timeout=10,
-        )
-        info = _json.loads(r.stdout) if r.returncode == 0 else {}
-        video_dur = float(info.get("format", {}).get("duration", 0))
-
-        r2 = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_format", str(paths.mic_audio)],
-            capture_output=True, text=True, timeout=10,
-        )
-        info2 = _json.loads(r2.stdout) if r2.returncode == 0 else {}
-        audio_dur = float(info2.get("format", {}).get("duration", 0))
+        video_dur = _ffprobe_duration(paths.video)
+        audio_dur = _ffprobe_duration(paths.mic_audio)
 
         if audio_dur > 0 and video_dur < audio_dur * 0.5:
             logger.warning(
@@ -121,11 +151,7 @@ def run_transcribe(
     result["session_id"] = paths.session_id
 
     # Обновляем JSON с session_id
-    import json
-    paths.transcript.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    save_transcript_data(paths.transcript, result)
     return result
 
 
@@ -134,31 +160,22 @@ def run_report(
     paths: SessionPaths,
 ) -> tuple[Path, Path]:
     """Сгенерировать протокол и summary для сессии."""
-    transcript = paths.transcript
-    if not transcript.exists():
-        raise PipelineError(
-            f"Транскрипт не найден: {transcript}. Сначала выполните транскрипцию."
-        )
-
-    try:
-        data = transcriber_load_transcript(transcript)
-    except Exception as exc:
-        raise PipelineError(f"Не удалось прочитать транскрипт: {exc}") from exc
+    data = _load_existing_transcript(paths)
 
     protocol_path = generate_protocol(data, paths, cfg)
     summary_path = generate_summary(data, paths, cfg)
 
     # Ключевые моменты — необязательный шаг, ошибки не блокируют pipeline
-    try:
-        generate_highlights(data, paths, cfg)
-    except Exception as exc:
-        logger.warning("Не удалось сгенерировать ключевые моменты: %s", exc)
+    _run_optional_step(
+        "Не удалось сгенерировать ключевые моменты",
+        lambda: generate_highlights(data, paths, cfg),
+    )
 
     # HTML-протокол генерируется как необязательный шаг — ошибки не блокируют pipeline
-    try:
-        generate_html_protocol(data, paths, cfg)
-    except Exception as exc:
-        logger.warning("Не удалось сгенерировать HTML-протокол: %s", exc)
+    _run_optional_step(
+        "Не удалось сгенерировать HTML-протокол",
+        lambda: generate_html_protocol(data, paths, cfg),
+    )
 
     return protocol_path, summary_path
 
@@ -170,15 +187,7 @@ def run_html(
     """Сгенерировать HTML-протокол для существующей сессии."""
     paths = resolve_session(cfg.output_dir, session_id)
 
-    if not paths.transcript.exists():
-        raise PipelineError(
-            f"Транскрипт не найден: {paths.transcript}. Сначала выполните транскрипцию."
-        )
-
-    try:
-        data = transcriber_load_transcript(paths.transcript)
-    except Exception as exc:
-        raise PipelineError(f"Не удалось прочитать транскрипт: {exc}") from exc
+    data = _load_existing_transcript(paths)
     return generate_html_protocol(data, paths, cfg)
 
 
@@ -265,14 +274,7 @@ def run_report_only(
 def run_highlights_only(cfg: AppConfig, session_id: str) -> Path:
     """Сгенерировать ключевые моменты для существующей сессии."""
     paths = resolve_session(cfg.output_dir, session_id)
-    if not paths.transcript.exists():
-        raise PipelineError(
-            f"Транскрипт не найден: {paths.transcript}. Сначала выполните транскрипцию."
-        )
-    try:
-        data = transcriber_load_transcript(paths.transcript)
-    except Exception as exc:
-        raise PipelineError(f"Не удалось прочитать транскрипт: {exc}") from exc
+    data = _load_existing_transcript(paths)
     return generate_highlights(data, paths, cfg)
 
 

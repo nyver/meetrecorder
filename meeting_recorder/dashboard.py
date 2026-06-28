@@ -8,6 +8,7 @@ from typing import Any
 from .config import AppConfig
 from .naming import SessionPaths
 from .report import _format_timestamp as _fmt_ts, _session_datetime as _parse_dt_impl
+from .session_utils import normalize_segments, pick_media
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +84,7 @@ def _session_meta(paths: SessionPaths, cfg: AppConfig) -> dict[str, Any]:
 
 def _pick_media(paths: SessionPaths) -> tuple[str, str] | None:
     """Выбрать лучший доступный медиафайл. Возвращает (filename, media_type)."""
-    if paths.final_video.exists():
-        return paths.final_video.name, "video"
-    if paths.mix_audio.exists():
-        return paths.mix_audio.name, "audio"
-    if paths.video.exists():
-        return paths.video.name, "video"
-    return None
+    return pick_media(paths, mime=False)
 
 
 # ---------------------------------------------------------------------------
@@ -154,20 +149,20 @@ def create_app(cfg: AppConfig) -> Any:
         if paths.transcript.exists():
             try:
                 data = json.loads(paths.transcript.read_text(encoding="utf-8"))
-                names = cfg.transcription.speaker_names
                 unique_spk = sorted({seg.get("speaker", "?") for seg in data.get("segments", [])})
                 colors = {
                     sp: _SPEAKER_COLORS[i % len(_SPEAKER_COLORS)]
                     for i, sp in enumerate(unique_spk)
                 }
-                for seg in data.get("segments", []):
-                    sp = seg.get("speaker", "?")
+                normalized = normalize_segments(data.get("segments", []), cfg.transcription.speaker_names)
+                for raw_seg, seg in zip(data.get("segments", []), normalized):
+                    sp = raw_seg.get("speaker", "?")
                     transcript.append({
                         "start": seg["start"],
                         "end": seg["end"],
-                        "speaker": names.get(sp, sp),
+                        "speaker": seg["speaker"],
                         "color": colors.get(sp, "#333"),
-                        "text": seg.get("text", "").strip(),
+                        "text": seg["text"],
                     })
             except Exception:
                 logger.warning("Не удалось прочитать транскрипт: %s", paths.transcript)
