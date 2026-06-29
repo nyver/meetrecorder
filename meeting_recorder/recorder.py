@@ -338,6 +338,41 @@ class MeetingRecorder:
 
     # -- internals ---------------------------------------------------------
 
+    @staticmethod
+    def _detect_dshow_mic() -> str | None:
+        """Вернуть dshow-имя первого доступного capture-устройства или None."""
+        import re
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
+            )
+            # ffmpeg пишет список устройств в stderr; audio-раздел идёт после video
+            audio_section = False
+            for line in result.stderr.splitlines():
+                if "(audio)" in line and not audio_section:
+                    audio_section = True
+                m = re.search(r'"([^"]+)"\s*\(audio\)', line)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+        return None
+
+    def _resolve_mic_device(self, rc) -> str:
+        """Вернуть имя mic-устройства: настроенное или автодетект."""
+        if rc.mic_device:
+            return rc.mic_device
+        detected = self._detect_dshow_mic()
+        if detected:
+            logger.info("Микрофон автодетект: %s", detected)
+            return detected
+        raise RuntimeError(
+            "Не удалось найти ни одного dshow audio capture-устройства. "
+            "Проверьте подключение микрофона или задайте mic_device в config.yaml явно."
+        )
+
     def _system_audio_input(self, rc) -> list[str]:
         if rc.system_audio_grabber == "wasapi":
             # WASAPI loopback: захватывает системный аудиовыход без доп. драйверов
@@ -367,12 +402,17 @@ class MeetingRecorder:
             "ffmpeg", "-y",
             # --- input 0: screen ---
             *screen_input,
-            # --- input 1: микрофон (dshow) ---
-            "-f", "dshow", "-i", f"audio={rc.mic_device}",
         ]
 
+        # input 1: микрофон (опционально)
+        if rc.record_mic:
+            mic_device = self._resolve_mic_device(rc)
+            cmd += ["-f", "dshow", "-i", f"audio={mic_device}"]
+
+        # input индекс для системного звука зависит от того, есть ли mic
+        sys_audio_input_idx = 2 if rc.record_mic else 1
+
         if rc.record_system_audio and rc.system_audio_grabber != "soundcard":
-            # --- input 2: системный звук (dshow/wasapi) ---
             cmd += self._system_audio_input(rc)
 
         cmd += [
@@ -385,19 +425,22 @@ class MeetingRecorder:
             # Fragmented MP4: moov не нужен в конце — файл валиден после force-kill
             "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
             str(self.paths.video),
-
-            # --- output 2: микрофон WAV ---
-            "-map", "1:a:0",
-            "-c:a", "pcm_s16le",
-            "-ar", str(rc.audio_sample_rate),
-            "-ac", "1",
-            str(self.paths.mic_audio),
         ]
+
+        if rc.record_mic:
+            cmd += [
+                # --- output 2: микрофон WAV ---
+                "-map", "1:a:0",
+                "-c:a", "pcm_s16le",
+                "-ar", str(rc.audio_sample_rate),
+                "-ac", "1",
+                str(self.paths.mic_audio),
+            ]
 
         if rc.record_system_audio and rc.system_audio_grabber != "soundcard":
             cmd += [
                 # --- output 3: системный звук WAV ---
-                "-map", "2:a:0",
+                "-map", f"{sys_audio_input_idx}:a:0",
                 "-c:a", "pcm_s16le",
                 "-ar", str(rc.audio_sample_rate),
                 "-ac", "1",

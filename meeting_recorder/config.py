@@ -21,7 +21,8 @@ class RecordingConfig(BaseModel):
     fps: int = Field(default=20, ge=1, le=60)
     video_codec: str = "libx264"
     audio_sample_rate: int = Field(default=48000, ge=8000, le=192000)
-    mic_device: str = "Настольный микрофон (Microsoft® LifeCam HD-3000)"
+    record_mic: bool = True
+    mic_device: str = ""  # "" — автодетект первого dshow capture-устройства
     system_audio_device: str = "virtual-audio-capturer"
     system_audio_grabber: Literal["dshow", "wasapi", "soundcard"] = "soundcard"
     record_system_audio: bool = True
