@@ -1,9 +1,11 @@
 """Тесты для llm_client.py — mock httpx."""
+
 from __future__ import annotations
 
-import pytest
 from unittest.mock import MagicMock, patch
+
 import httpx
+import pytest
 from pydantic import SecretStr
 
 from meeting_recorder.config import LLMConfig
@@ -11,8 +13,9 @@ from meeting_recorder.llm_client import LLMClient, LLMClientError, create_llm_cl
 
 
 def _cfg(**kw) -> LLMConfig:
-    base = dict(backend="local", base_url="http://localhost:8080/v1",
-                model="test", timeout=5.0)
+    base = dict(
+        backend="local", base_url="http://localhost:8080/v1", model="test", timeout=5.0
+    )
     base.update(kw)
     return LLMConfig(**base)
 
@@ -31,11 +34,12 @@ def _ok_response(content: str = "reply") -> MagicMock:
 # LLMClient: инициализация
 # ---------------------------------------------------------------------------
 
+
 class TestLLMClientInit:
     def test_no_api_key(self):
         with patch("meeting_recorder.llm_client.httpx.Client") as mock_cls:
             mock_cls.return_value = MagicMock()
-            client = LLMClient(_cfg())
+            LLMClient(_cfg())
             # Authorization не передаётся
             call_kwargs = mock_cls.call_args[1]
             assert "Authorization" not in call_kwargs.get("headers", {})
@@ -64,6 +68,7 @@ class TestLLMClientInit:
 # LLMClient.chat
 # ---------------------------------------------------------------------------
 
+
 class TestLLMClientChat:
     def _client_with_mock_http(self, mock_http: MagicMock) -> LLMClient:
         with patch("meeting_recorder.llm_client.httpx.Client") as mock_cls:
@@ -91,7 +96,9 @@ class TestLLMClientChat:
         mock_resp.text = "unauthorized"
         err = httpx.HTTPStatusError("401", request=MagicMock(), response=mock_resp)
         mock_http = MagicMock()
-        mock_http.post.return_value = MagicMock(raise_for_status=MagicMock(side_effect=err))
+        mock_http.post.return_value = MagicMock(
+            raise_for_status=MagicMock(side_effect=err)
+        )
         client = self._client_with_mock_http(mock_http)
         with pytest.raises(LLMClientError, match="авторизации"):
             client.chat([{"role": "user", "content": "x"}])
@@ -102,7 +109,9 @@ class TestLLMClientChat:
         mock_resp.text = "server error"
         err = httpx.HTTPStatusError("500", request=MagicMock(), response=mock_resp)
         mock_http = MagicMock()
-        mock_http.post.return_value = MagicMock(raise_for_status=MagicMock(side_effect=err))
+        mock_http.post.return_value = MagicMock(
+            raise_for_status=MagicMock(side_effect=err)
+        )
         client = self._client_with_mock_http(mock_http)
         with pytest.raises(LLMClientError, match="500"):
             client.chat([{"role": "user", "content": "x"}])
@@ -126,10 +135,12 @@ class TestLLMClientChat:
         r = MagicMock()
         r.raise_for_status = MagicMock()
         r.json.return_value = {
-            "choices": [{
-                "message": {"content": "", "reasoning_content": "thinking..."},
-                "finish_reason": "length",
-            }],
+            "choices": [
+                {
+                    "message": {"content": "", "reasoning_content": "thinking..."},
+                    "finish_reason": "length",
+                }
+            ],
             "usage": {},
         }
         mock_http.post.return_value = r
@@ -155,8 +166,8 @@ class TestLLMClientChat:
         chunks = [
             'data: {"choices": [{"delta": {"content": "He"}}]}',
             'data: {"choices": [{"delta": {"content": "llo"}}]}',
-            'data: [DONE]',
-            '',
+            "data: [DONE]",
+            "",
         ]
         mock_resp = MagicMock()
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
@@ -174,6 +185,7 @@ class TestLLMClientChat:
 # ---------------------------------------------------------------------------
 # LLMClient.health_check
 # ---------------------------------------------------------------------------
+
 
 class TestHealthCheck:
     def _client(self) -> tuple[LLMClient, MagicMock]:
@@ -201,6 +213,7 @@ class TestHealthCheck:
 # ---------------------------------------------------------------------------
 # create_llm_client
 # ---------------------------------------------------------------------------
+
 
 class TestCreateLLMClient:
     def test_success(self):
@@ -233,6 +246,7 @@ class TestCreateLLMClient:
 
     def test_openrouter_logs_warning(self, caplog):
         import logging
+
         cfg = _cfg(backend="openrouter")
         with patch("meeting_recorder.llm_client.LLMClient") as MockClient:
             inst = MagicMock()
@@ -241,3 +255,131 @@ class TestCreateLLMClient:
             with caplog.at_level(logging.WARNING, logger="meeting_recorder.llm_client"):
                 create_llm_client(cfg)
         assert any("openrouter" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Повторы, обрезанные ответы, транспортные ошибки
+# ---------------------------------------------------------------------------
+
+from meeting_recorder.llm_client import LLMTruncatedError  # noqa: E402
+
+
+def _status_error(status: int, headers: dict | None = None) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = f"status {status}"
+    resp.headers = headers or {}
+    err = httpx.HTTPStatusError(str(status), request=MagicMock(), response=resp)
+    return MagicMock(raise_for_status=MagicMock(side_effect=err))
+
+
+def _client(mock_http: MagicMock, **cfg_kw) -> LLMClient:
+    with patch("meeting_recorder.llm_client.httpx.Client", return_value=mock_http):
+        return LLMClient(_cfg(**cfg_kw))
+
+
+class TestRetries:
+    def test_retry_on_500_then_success(self):
+        mock_http = MagicMock()
+        mock_http.post.side_effect = [_status_error(500), _ok_response("ok")]
+        assert _client(mock_http).chat([{"role": "user", "content": "x"}]) == "ok"
+        assert mock_http.post.call_count == 2
+
+    def test_retry_exhausted(self):
+        mock_http = MagicMock()
+        mock_http.post.return_value = _status_error(503)
+        with pytest.raises(LLMClientError, match="503"):
+            _client(mock_http, max_retries=2).chat([{"role": "user", "content": "x"}])
+        assert mock_http.post.call_count == 3
+
+    def test_no_retry_on_400(self):
+        mock_http = MagicMock()
+        mock_http.post.return_value = _status_error(400)
+        with pytest.raises(LLMClientError, match="400"):
+            _client(mock_http).chat([{"role": "user", "content": "x"}])
+        assert mock_http.post.call_count == 1
+
+    def test_no_retry_on_auth_error(self):
+        mock_http = MagicMock()
+        mock_http.post.return_value = _status_error(403)
+        with pytest.raises(LLMClientError, match="авторизации"):
+            _client(mock_http).chat([{"role": "user", "content": "x"}])
+        assert mock_http.post.call_count == 1
+
+    def test_retry_after_header_respected(self):
+        mock_http = MagicMock()
+        mock_http.post.side_effect = [
+            _status_error(429, {"retry-after": "7"}),
+            _ok_response(),
+        ]
+        with patch("meeting_recorder.llm_client._sleep") as mock_sleep:
+            _client(mock_http).chat([{"role": "user", "content": "x"}])
+        mock_sleep.assert_called_once_with(7.0)
+
+    def test_zero_retries(self):
+        mock_http = MagicMock()
+        mock_http.post.side_effect = httpx.ConnectError("refused")
+        with pytest.raises(LLMClientError):
+            _client(mock_http, max_retries=0).chat([{"role": "user", "content": "x"}])
+        assert mock_http.post.call_count == 1
+
+    def test_read_error_wrapped_and_retried(self):
+        mock_http = MagicMock()
+        mock_http.post.side_effect = [httpx.ReadError("reset"), _ok_response("ok")]
+        assert _client(mock_http).chat([{"role": "user", "content": "x"}]) == "ok"
+
+    def test_remote_protocol_error_wrapped(self):
+        mock_http = MagicMock()
+        mock_http.post.side_effect = httpx.RemoteProtocolError("bad")
+        with pytest.raises(LLMClientError, match="Сетевая ошибка"):
+            _client(mock_http, max_retries=0).chat([{"role": "user", "content": "x"}])
+
+
+class TestResponseParsing:
+    def test_invalid_json_wrapped(self):
+        r = MagicMock()
+        r.raise_for_status = MagicMock()
+        r.json.side_effect = ValueError("no json")
+        mock_http = MagicMock()
+        mock_http.post.return_value = r
+        with pytest.raises(LLMClientError, match="не-JSON"):
+            _client(mock_http).chat([{"role": "user", "content": "x"}])
+
+    def test_empty_choices(self):
+        r = MagicMock()
+        r.raise_for_status = MagicMock()
+        r.json.return_value = {"choices": []}
+        mock_http = MagicMock()
+        mock_http.post.return_value = r
+        with pytest.raises(LLMClientError, match="choices"):
+            _client(mock_http).chat([{"role": "user", "content": "x"}])
+
+    def test_truncated_with_content_raises_with_partial(self):
+        r = MagicMock()
+        r.raise_for_status = MagicMock()
+        r.json.return_value = {
+            "choices": [{"message": {"content": "half"}, "finish_reason": "length"}],
+        }
+        mock_http = MagicMock()
+        mock_http.post.return_value = r
+        with pytest.raises(LLMTruncatedError) as ei:
+            _client(mock_http).chat([{"role": "user", "content": "x"}])
+        assert ei.value.partial == "half"
+
+    def test_stream_skips_service_chunks(self):
+        chunks = [
+            ": OPENROUTER PROCESSING",
+            'data: {"choices": [{"delta": {"content": "Hi"}}]}',
+            'data: {"choices": [], "usage": {"total_tokens": 3}}',
+            'data: {"choices": [{"delta": {}}]}',
+            "data: [DONE]",
+        ]
+        resp = MagicMock()
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        resp.iter_lines = MagicMock(return_value=iter(chunks))
+        mock_http = MagicMock()
+        mock_http.stream.return_value = resp
+        client = _client(mock_http)
+        assert client.chat([{"role": "user", "content": "x"}], stream=True) == "Hi"
+        assert mock_http.stream.call_args.kwargs["json"]["stream"] is True

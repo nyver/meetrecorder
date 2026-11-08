@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-import os
+import re
 from pathlib import Path
 
 
@@ -76,16 +76,35 @@ def list_sessions(output_dir: str) -> list[SessionPaths]:
     if not root.is_dir():
         return result
     for subdir in sorted(root.iterdir()):
-        if subdir.is_dir() and subdir.name.startswith("meeting_"):
+        if subdir.is_dir() and is_valid_session_id(subdir.name):
             result.append(SessionPaths(output_dir, subdir.name))
     return result
 
 
+_SESSION_ID_RE = re.compile(r"^meeting_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(_\d+)?$")
+
+
+def is_valid_session_id(session_id: str) -> bool:
+    """True, если session_id имеет формат meeting_YYYY-MM-DD_HH-MM-SS[_N].
+
+    Строгая проверка формата исключает path traversal (``..``, ``\\``, ``/``)
+    при использовании session_id, пришедшего извне (CLI, HTTP).
+    """
+    return bool(_SESSION_ID_RE.fullmatch(session_id))
+
+
 def resolve_session(output_dir: str, session_id: str) -> SessionPaths:
-    """Найти существующую сессию или поднять ошибку."""
+    """Найти существующую сессию или поднять ошибку.
+
+    Raises:
+        FileNotFoundError: session_id некорректен или каталог сессии не найден.
+    """
+    if not is_valid_session_id(session_id):
+        raise FileNotFoundError(f"Некорректный идентификатор сессии: '{session_id}'")
+    root = Path(output_dir).resolve()
     session_dir = Path(output_dir) / session_id
+    if session_dir.resolve().parent != root:
+        raise FileNotFoundError(f"Сессия '{session_id}' вне каталога '{output_dir}'")
     if not session_dir.is_dir():
-        raise FileNotFoundError(
-            f"Сессия '{session_id}' не найдена в '{output_dir}'"
-        )
+        raise FileNotFoundError(f"Сессия '{session_id}' не найдена в '{output_dir}'")
     return SessionPaths(output_dir, session_id)

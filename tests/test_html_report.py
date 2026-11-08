@@ -1,4 +1,5 @@
 """Юнит-тесты для html_report.py."""
+
 from __future__ import annotations
 
 import json
@@ -6,10 +7,9 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from meeting_recorder.config import AppConfig
 from meeting_recorder.html_report import (
     _color_map,
     _inline,
@@ -18,7 +18,6 @@ from meeting_recorder.html_report import (
     _pick_media,
     generate_html_protocol,
 )
-from meeting_recorder.config import AppConfig
 from meeting_recorder.naming import SessionPaths
 
 _SESSION_ID = "meeting_2026-06-14_10-00-00"
@@ -48,6 +47,7 @@ def _transcript(**kwargs) -> dict:
 # _color_map
 # ---------------------------------------------------------------------------
 
+
 class TestColorMap:
     def test_first_speaker_gets_first_color(self):
         result = _color_map(["A"])
@@ -71,6 +71,7 @@ class TestColorMap:
 # ---------------------------------------------------------------------------
 # _pick_media
 # ---------------------------------------------------------------------------
+
 
 class TestPickMedia:
     def test_final_video_has_highest_priority(self, tmp_path):
@@ -106,6 +107,7 @@ class TestPickMedia:
 # _is_sep_row
 # ---------------------------------------------------------------------------
 
+
 class TestIsSepRow:
     def test_simple_separator(self):
         assert _is_sep_row("|---|---|---|")
@@ -136,6 +138,7 @@ class TestIsSepRow:
 # _inline
 # ---------------------------------------------------------------------------
 
+
 class TestInline:
     def test_bold(self):
         assert _inline("**жирный**") == "<strong>жирный</strong>"
@@ -158,6 +161,7 @@ class TestInline:
 # ---------------------------------------------------------------------------
 # _md_to_html
 # ---------------------------------------------------------------------------
+
 
 class TestMdToHtml:
     # --- Заголовки ---
@@ -278,6 +282,7 @@ class TestMdToHtml:
 # generate_html_protocol
 # ---------------------------------------------------------------------------
 
+
 class TestGenerateHtmlProtocol:
     def test_creates_html_file(self, tmp_path):
         p = _paths(tmp_path)
@@ -300,14 +305,18 @@ class TestGenerateHtmlProtocol:
     def test_from_file_path(self, tmp_path):
         p = _paths(tmp_path)
         json_path = p.dir / "t.json"
-        json_path.write_text(json.dumps(_transcript(), ensure_ascii=False), encoding="utf-8")
+        json_path.write_text(
+            json.dumps(_transcript(), ensure_ascii=False), encoding="utf-8"
+        )
         result = generate_html_protocol(str(json_path), p, AppConfig())
         assert result.exists()
 
     def test_from_path_object(self, tmp_path):
         p = _paths(tmp_path)
         json_path = p.dir / "t.json"
-        json_path.write_text(json.dumps(_transcript(), ensure_ascii=False), encoding="utf-8")
+        json_path.write_text(
+            json.dumps(_transcript(), ensure_ascii=False), encoding="utf-8"
+        )
         result = generate_html_protocol(json_path, p, AppConfig())
         assert result.exists()
 
@@ -357,14 +366,27 @@ class TestGenerateHtmlProtocol:
         content = p.html_protocol.read_text(encoding="utf-8")
         assert "no-media" in content
 
-    def test_mux_attempted_when_video_and_audio_exist(self, tmp_path):
+    def test_html_generation_never_muxes(self, tmp_path):
+        """Mux — отдельный шаг пайплайна, HTML-генерация не кодирует видео."""
         p = _paths(tmp_path)
         p.video.write_bytes(b"")
         p.mix_audio.write_bytes(b"")
         with patch("meeting_recorder.recorder.mux_video") as mock_mux:
-            mock_mux.return_value = p.final_video
             generate_html_protocol(_transcript(), p, AppConfig())
-        mock_mux.assert_called_once_with(p.video, p.mix_audio, p.final_video)
+        mock_mux.assert_not_called()
+        # Без финального видео плеер использует mix-аудио
+        assert p.mix_audio.name in p.html_protocol.read_text(encoding="utf-8")
+
+    def test_highlight_string_timestamp_does_not_crash(self, tmp_path):
+        import json as _json
+
+        p = _paths(tmp_path)
+        p.highlights.write_text(
+            _json.dumps([{"title": "T", "description": "D", "start": "01:05"}]),
+            encoding="utf-8",
+        )
+        generate_html_protocol(_transcript(), p, AppConfig())
+        assert "seek(65.00)" in p.html_protocol.read_text(encoding="utf-8")
 
     def test_mux_not_attempted_when_final_exists(self, tmp_path):
         p = _paths(tmp_path)
@@ -386,24 +408,41 @@ class TestGenerateHtmlProtocol:
         p = _paths(tmp_path)
         p.video.write_bytes(b"")
         p.mix_audio.write_bytes(b"")
-        with patch("meeting_recorder.recorder.mux_video", side_effect=RuntimeError("ffmpeg failed")):
+        with patch(
+            "meeting_recorder.recorder.mux_video",
+            side_effect=RuntimeError("ffmpeg failed"),
+        ):
             result = generate_html_protocol(_transcript(), p, AppConfig())
         assert result.exists()
 
     def test_xss_in_speaker_name_escaped(self, tmp_path):
         p = _paths(tmp_path)
-        tr = _transcript(segments=[
-            {"start": 0.0, "end": 1.0, "speaker": "<script>xss</script>", "text": "text"},
-        ])
+        tr = _transcript(
+            segments=[
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "<script>xss</script>",
+                    "text": "text",
+                },
+            ]
+        )
         generate_html_protocol(tr, p, AppConfig())
         content = p.html_protocol.read_text(encoding="utf-8")
         assert "<script>xss</script>" not in content
 
     def test_xss_in_segment_text_escaped(self, tmp_path):
         p = _paths(tmp_path)
-        tr = _transcript(segments=[
-            {"start": 0.0, "end": 1.0, "speaker": "S", "text": '<img onerror="alert(1)">'},
-        ])
+        tr = _transcript(
+            segments=[
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "S",
+                    "text": '<img onerror="alert(1)">',
+                },
+            ]
+        )
         generate_html_protocol(tr, p, AppConfig())
         content = p.html_protocol.read_text(encoding="utf-8")
         assert '<img onerror="alert(1)">' not in content

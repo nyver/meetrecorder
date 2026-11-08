@@ -4,32 +4,57 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import time
 from pathlib import Path
+from typing import IO
 
 # Принудительно UTF-8 на Windows (иначе кириллица ломается в консоли)
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONUTF8", "1")
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
-import click
+import click  # noqa: E402
 
-from meeting_recorder.config import AppConfig, load_config
-from meeting_recorder.naming import list_sessions, resolve_session
-from meeting_recorder.pipeline import PipelineError, run_highlights_only, run_html, run_process, run_report_only, run_transcribe_only
-from meeting_recorder.session_utils import save_transcript_data
+from meeting_recorder import __version__  # noqa: E402
+from meeting_recorder.config import AppConfig, load_config, resolve_config_path  # noqa: E402
+from meeting_recorder.naming import list_sessions, resolve_session  # noqa: E402
+from meeting_recorder.pipeline import (  # noqa: E402
+    PipelineError,
+    _rename_with_retry,  # noqa: F401  (реэкспорт для обратной совместимости)
+    finalize_recording,
+    process_session,
+    run_highlights_only,
+    run_html,
+    run_mux,
+    run_process,
+    run_report_only,
+)
 
 logger = logging.getLogger("meeting_recorder")
+
+# Ошибки, которые CLI-команды показывают пользователю без traceback
+_USER_ERRORS = (PipelineError, FileNotFoundError)
 
 # ---------------------------------------------------------------------------
 # Состояние записи (persistence на диск)
 # ---------------------------------------------------------------------------
+
+
+def _app_data_dir() -> Path:
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        return (
+            Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        ) / "MeetingRecorder"
+    xdg = os.environ.get("XDG_STATE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".local" / "state") / "MeetingRecorder"
 
 
 def _default_state_dir() -> Path:
@@ -38,14 +63,7 @@ def _default_state_dir() -> Path:
     if override:
         return Path(override)
 
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    else:
-        xdg = os.environ.get("XDG_RUNTIME_DIR")
-        base = Path(xdg) if xdg else Path.home() / ".local" / "share"
-    candidate = base / "MeetingRecorder" / ".state"
-
+    candidate = _app_data_dir() / ".state"
     try:
         candidate.mkdir(parents=True, exist_ok=True)
         probe = candidate / ".write_test"
@@ -56,21 +74,38 @@ def _default_state_dir() -> Path:
         return Path.cwd() / ".meeting_recorder_state"
 
 
+def _default_log_file() -> Path:
+    """Путь к лог-файлу; не зависит от cwd (важно для автозапуска трея)."""
+    override = os.environ.get("MEETING_RECORDER_LOG_FILE")
+    if override:
+        return Path(override)
+    return _app_data_dir() / "logs" / "meeting_recorder.log"
+
+
 _STATE_DIR = _default_state_dir()
 _STATE_FILE = _STATE_DIR / "active_session.json"
 _STOP_FILE = _STATE_DIR / "stop_requested"
 _DONE_FILE = _STATE_DIR / "recording_done"
+_LOCK_FILE = _STATE_DIR / "recording.lock"
+
+_STOP_WAIT_SECS = 30  # ожидание завершения `mrec start` после stop-сигнала
 
 
 def _ensure_state_dir() -> None:
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _save_state(session_id: str, video_path: str, ffmpeg_pid: int | None = None) -> None:
+def _save_state(
+    session_id: str, video_path: str, ffmpeg_pid: int | None = None
+) -> None:
     _ensure_state_dir()
     _STATE_FILE.write_text(
         json.dumps(
-            {"session_id": session_id, "video_path": video_path, "ffmpeg_pid": ffmpeg_pid},
+            {
+                "session_id": session_id,
+                "video_path": video_path,
+                "ffmpeg_pid": ffmpeg_pid,
+            },
             ensure_ascii=False,
         ),
         encoding="utf-8",
@@ -94,23 +129,181 @@ def _remove_state() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Lock-файл процесса `mrec start`
+# ---------------------------------------------------------------------------
+# Пока `mrec start` жив, он удерживает эксклюзивную блокировку на _LOCK_FILE.
+# ОС снимает блокировку при завершении процесса (в т.ч. аварийном), поэтому
+# состояние «запись идёт» нельзя спутать с устаревшим state-файлом.
+
+
+def _try_lock(fh: IO) -> bool:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(fh: IO) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _acquire_start_lock() -> IO | None:
+    """Захватить lock записи. Возвращает дескриптор или None, если lock занят."""
+    _ensure_state_dir()
+    fh = open(_LOCK_FILE, "a+", encoding="utf-8")
+    if _try_lock(fh):
+        return fh
+    fh.close()
+    return None
+
+
+def _release_start_lock(fh: IO | None) -> None:
+    if fh is not None:
+        _unlock(fh)
+        fh.close()
+
+
+def _is_recorder_alive() -> bool:
+    """True, если процесс `mrec start` сейчас работает (держит lock)."""
+    fh = _acquire_start_lock()
+    if fh is None:
+        return True
+    _release_start_lock(fh)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """Настроить логирование (console + file)."""
+    """Настроить логирование (console + ротируемый файл)."""
     level = logging.DEBUG if verbose else logging.INFO
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
-            "meeting_recorder.log",
-            encoding="utf-8",
-        ),
-    ]
+    handlers: list[logging.Handler] = []
+    if sys.stdout is not None:  # None под pythonw / --noconsole
+        handlers.append(logging.StreamHandler(sys.stdout))
+    log_file = _default_log_file()
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            )
+        )
+    except OSError:
+        pass
     logging.basicConfig(level=level, format=fmt, handlers=handlers)
+
+
+def _subprocess_kwargs() -> dict:
+    from meeting_recorder.recorder import no_window_kwargs
+
+    return no_window_kwargs()
+
+
+def _is_ffmpeg_process(pid: int) -> bool:
+    """Проверить, что PID принадлежит ffmpeg (защита от переиспользования PID)."""
+    import subprocess as sp
+
+    try:
+        if sys.platform == "win32":
+            result = sp.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                **_subprocess_kwargs(),
+            )
+        else:
+            result = sp.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+    except Exception as exc:
+        logger.debug("Не удалось проверить процесс PID=%s: %s", pid, exc)
+        return False
+    out = (result.stdout or "").lower()
+    return "ffmpeg" in out and (sys.platform != "win32" or str(pid) in out)
+
+
+def _stop_ffmpeg_graceful(pid: int, timeout: int = 15) -> bool:
+    """Graceful stop ffmpeg по PID через CTRL_BREAK_EVENT, затем ждём завершения.
+
+    Перед отправкой сигнала проверяется, что PID принадлежит ffmpeg: state-файл
+    мог устареть, а Windows переиспользует PID — без проверки можно убить
+    посторонний процесс.
+
+    Returns:
+        True — процесс завершился (или его уже нет); False — пришлось убить.
+    """
+    import signal
+    import subprocess as sp
+
+    if not _is_ffmpeg_process(pid):
+        logger.info("PID=%s не является ffmpeg (процесс завершён) — пропускаю", pid)
+        return True
+
+    try:
+        if sys.platform == "win32":
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        logger.debug("Сигнал остановки отправлен ffmpeg PID=%s", pid)
+    except (ProcessLookupError, PermissionError):
+        logger.info("ffmpeg PID=%s уже завершён", pid)
+        return True
+    except Exception as e:
+        logger.debug("Ошибка отправки сигнала PID=%s: %s", pid, e)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_ffmpeg_process(pid):
+            logger.info("ffmpeg PID=%s завершился штатно", pid)
+            return True
+        time.sleep(0.5)
+
+    logger.warning(
+        "ffmpeg PID=%s не завершился за %ds — принудительное завершение", pid, timeout
+    )
+    try:
+        if sys.platform == "win32":
+            sp.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=5,
+                **_subprocess_kwargs(),
+            )
+        else:
+            os.kill(pid, signal.SIGKILL)
+        time.sleep(1.5)  # Дать ОС время закрыть файловые хэндлы
+    except Exception as e:
+        logger.error("Принудительное завершение ffmpeg PID=%s не удалось: %s", pid, e)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +312,11 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="mrec")
+@click.version_option(version=__version__, prog_name="mrec")
 @click.option("-v", "--verbose", is_flag=True, help="Подробное логирование")
-@click.option("-c", "--config", "config_path", type=click.Path(), help="Путь к config.yaml")
+@click.option(
+    "-c", "--config", "config_path", type=click.Path(), help="Путь к config.yaml"
+)
 @click.pass_context
 def cli(ctx, verbose, config_path):
     """Meeting Recorder — запись экрана, транскрипция и генерация отчётов."""
@@ -149,83 +344,36 @@ def cli(ctx, verbose, config_path):
     ctx.obj["cfg"] = cfg
 
 
-def _rename_with_retry(src: Path, dst: Path, retries: int = 10, delay: float = 0.5) -> None:
-    """Переименовать файл с повторными попытками (файл может быть временно заблокирован)."""
-    for attempt in range(retries):
-        try:
-            src.rename(dst)
-            return
-        except PermissionError:
-            if attempt == retries - 1:
-                raise
-            time.sleep(delay)
-
-
-def _stop_ffmpeg_graceful(pid: int, timeout: int = 15) -> bool:
-    """Graceful stop ffmpeg по PID через CTRL_BREAK_EVENT, затем ждём завершения.
-
-    CTRL_BREAK_EVENT позволяет ffmpeg финализировать контейнер и закрыть файлы.
-    Работает только если ffmpeg запущен с CREATE_NEW_PROCESS_GROUP.
-    Если процесс не завершился за timeout — форс-килл как запасной вариант.
-    """
-    import os
-    import signal
-    import subprocess as sp
-
-    try:
-        if sys.platform == "win32":
-            os.kill(pid, signal.CTRL_BREAK_EVENT)
-        else:
-            os.kill(pid, signal.SIGTERM)
-        logger.debug("Сигнал остановки отправлен ffmpeg PID=%s", pid)
-    except (ProcessLookupError, PermissionError):
-        logger.info("ffmpeg PID=%s уже завершён", pid)
-        return True
-    except Exception as e:
-        logger.debug("Ошибка отправки сигнала PID=%s: %s", pid, e)
-
-    # Ждём завершения
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = sp.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            capture_output=True, text=True,
-        )
-        if str(pid) not in result.stdout:
-            logger.info("ffmpeg PID=%s завершился штатно", pid)
-            return True
-        time.sleep(0.5)
-
-    # Форс-килл как запасной вариант
-    logger.warning("ffmpeg PID=%s не завершился за %ds — принудительное завершение", pid, timeout)
-    try:
-        sp.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5)
-        time.sleep(1.5)  # Дать Windows время закрыть файловые хэндлы
-    except Exception as e:
-        logger.error("Принудительное завершение ffmpeg PID=%s не удалось: %s", pid, e)
-    return False
-
-
 @cli.command()
 @click.pass_context
 def start(ctx):
     """Начать запись экрана и звука."""
     cfg = ctx.obj["cfg"]
 
-    # Проверяем, нет ли уже идущей записи
     existing = _load_state()
     if existing:
         sid = existing.get("session_id", "?")
-        print(f"⚠️ Уже идёт запись сессии: {sid}")
-        print(f"   Остановите её командой: mrec stop")
-        return
+        if _is_recorder_alive():
+            print(f"⚠️ Уже идёт запись сессии: {sid}")
+            print("   Остановите её командой: mrec stop")
+            return
+        # Процесс записи не работает — state-файл остался от аварийного завершения
+        logger.warning("Найдено устаревшее состояние записи (%s) — очищаю", sid)
+        print(f"⚠️ Предыдущая запись ({sid}) была прервана аварийно.")
+        print(f"   Обработать её можно командой: mrec process {sid}")
+        _remove_state()
 
     from meeting_recorder.naming import create_session
     from meeting_recorder.recorder import MeetingRecorder
 
+    lock = _acquire_start_lock()
+    if lock is None:
+        print("⚠️ Уже идёт запись (другой процесс mrec start).")
+        return
+
     recorder = None
+    paths = None
     try:
-        _ensure_state_dir()
         _STOP_FILE.unlink(missing_ok=True)
         _DONE_FILE.unlink(missing_ok=True)
 
@@ -238,9 +386,8 @@ def start(ctx):
         logger.info("Запись начата: %s (ffmpeg PID=%s)", paths.session_id, ffmpeg_pid)
         print(f"\n✅ Запись начата: {paths.session_id}")
         print(f"   Папка: {paths.dir}")
-        print(f"   Остановить: mrec stop  (или Ctrl+C)\n")
+        print("   Остановить: mrec stop  (или Ctrl+C)\n")
 
-        # Блокируем до получения сигнала остановки
         while not _STOP_FILE.exists():
             time.sleep(0.5)
         logger.info("Stop-сигнал получен — останавливаю запись")
@@ -250,23 +397,36 @@ def start(ctx):
         logger.error("Ошибка запуска записи: %s", exc)
         print(f"\n❌ Ошибка запуска записи: {exc}\n")
     finally:
-        # Останавливаем ffmpeg И soundcard-захват, ждём сохранения файлов
-        if recorder is not None:
-            recorder.stop()
+        try:
+            if recorder is not None and recorder.is_recording:
+                recorder.stop()
+                logger.info("Запись завершена: %s", paths.session_id)
+        finally:
             _DONE_FILE.touch()
-            logger.info("Запись завершена: %s", paths.session_id)
-        _STOP_FILE.unlink(missing_ok=True)
-        _remove_state()
+            _STOP_FILE.unlink(missing_ok=True)
+            _remove_state()
+            _release_start_lock(lock)
 
 
 def _signal_stop_and_wait(ffmpeg_pid: int | None) -> None:
-    """Послать stop-сигнал процессу mrec start и дождаться завершения записи."""
+    """Послать stop-сигнал процессу mrec start и дождаться завершения записи.
+
+    Если `mrec start` уже не работает (аварийное завершение), ждать нечего —
+    останавливаем осиротевший ffmpeg напрямую (после проверки PID).
+    """
     _ensure_state_dir()
     _DONE_FILE.unlink(missing_ok=True)
-    _STOP_FILE.touch()
 
+    if not _is_recorder_alive():
+        logger.warning("Процесс mrec start не запущен — состояние записи устарело")
+        if ffmpeg_pid:
+            _stop_ffmpeg_graceful(int(ffmpeg_pid))
+        _remove_state()
+        return
+
+    _STOP_FILE.touch()
     print("⏳ Ожидаю завершения записи…")
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + _STOP_WAIT_SECS
     while time.monotonic() < deadline:
         time.sleep(0.5)
         if _DONE_FILE.exists():
@@ -284,37 +444,31 @@ def _signal_stop_and_wait(ffmpeg_pid: int | None) -> None:
 
 def _mix_session_audio(paths, cfg) -> bool:
     """Свести аудиодорожки сессии. Возвращает True при успехе."""
-    from meeting_recorder.recorder import mix_audio_files
-
     print("🔊 Свожу аудио…")
     try:
-        if paths.mic_audio.exists() and paths.system_audio.exists():
-            mix_audio_files(
-                paths.mic_audio,
-                paths.system_audio,
-                paths.mix_audio,
-                cfg.recording.audio_sample_rate,
-            )
-            logger.info("Аудио сведено: %s", paths.mix_audio)
-        elif paths.mic_audio.exists():
-            _rename_with_retry(paths.mic_audio, paths.mix_audio)
-            logger.info("Аудио (только микрофон): %s", paths.mix_audio)
-        elif paths.system_audio.exists():
-            _rename_with_retry(paths.system_audio, paths.mix_audio)
-            logger.info("Аудио (только системный звук): %s", paths.mix_audio)
-        else:
-            logger.warning("Аудиофайлы не найдены — ffmpeg не записал данные")
-            return False
-    except Exception as e:
-        logger.warning("Не удалось свести аудио: %s", e)
+        finalize_recording(cfg, paths)
+    except PipelineError as e:
+        logger.warning("%s", e)
         return False
     return True
 
 
+def _print_ffmpeg_log_tail(paths, lines: int = 30) -> None:
+    ffmpeg_log = paths.ffmpeg_log
+    if ffmpeg_log.exists():
+        print(f"   Лог ffmpeg ({ffmpeg_log.name}):")
+        tail = ffmpeg_log.read_text(encoding="utf-8", errors="replace").splitlines()[
+            -lines:
+        ]
+        for line in tail:
+            print(f"     {line}")
+    else:
+        print("   Проверьте mic_device и system_audio_* в config.yaml")
+    print(f"   Папка сессии: {paths.dir}")
+
+
 def _load_active_session(cfg) -> tuple[str | None, int | None, object | None]:
     """Загрузить активную сессию. Возвращает (session_id, ffmpeg_pid, paths)."""
-    from meeting_recorder.naming import resolve_session
-
     state = _load_state()
     if state is None:
         print("⚠️ Запись не идёт. Нечего останавливать.")
@@ -334,6 +488,7 @@ def _load_active_session(cfg) -> tuple[str | None, int | None, object | None]:
         paths = resolve_session(cfg.output_dir, session_id)
     except FileNotFoundError as e:
         print(f"❌ Сессия не найдена: {e}")
+        _remove_state()
         return None, None, None
 
     return session_id, ffmpeg_pid, paths
@@ -352,12 +507,8 @@ def stop_only_cmd(ctx):
     _signal_stop_and_wait(ffmpeg_pid)
 
     if not _mix_session_audio(paths, cfg):
-        ffmpeg_log = paths.ffmpeg_log
-        print(f"\n❌ Аудиофайлы не созданы.")
-        if ffmpeg_log.exists():
-            for line in ffmpeg_log.read_text(errors="replace").splitlines()[-20:]:
-                print(f"     {line}")
-        print(f"   Папка сессии: {paths.dir}")
+        print("\n❌ Аудиофайлы не созданы.")
+        _print_ffmpeg_log_tail(paths, lines=20)
         return
 
     print(f"\n✅ Запись остановлена: {paths.dir}")
@@ -377,48 +528,26 @@ def stop(ctx):
     _signal_stop_and_wait(ffmpeg_pid)
 
     if not _mix_session_audio(paths, cfg):
-        ffmpeg_log = paths.ffmpeg_log
-        print(f"\n❌ Аудиофайлы не созданы — ffmpeg не смог записать данные.")
-        if ffmpeg_log.exists():
-            tail = ffmpeg_log.read_text(errors="replace").splitlines()[-30:]
-            print(f"   Лог ffmpeg ({ffmpeg_log.name}):")
-            for line in tail:
-                print(f"     {line}")
-        else:
-            print(f"   Проверьте mic_device и system_audio_device в config.yaml")
-        print(f"   Папка сессии: {paths.dir}")
+        print("\n❌ Аудиофайлы не созданы — ffmpeg не смог записать данные.")
+        _print_ffmpeg_log_tail(paths)
         return
 
-    # Запускаем пайплайн
-    print("\n🚀 Запускаю пайплайн: транскрипция → протокол → summary → highlights → HTML…\n")
+    print(
+        "\n🚀 Запускаю пайплайн: транскрипция → протокол → summary → "
+        "highlights → HTML…\n"
+    )
     try:
-        from meeting_recorder.transcriber import transcribe
-        from meeting_recorder.pipeline import run_report
-
-        # Транскрипция
-        print("📝 Транскрипция…")
-        result = transcribe(
-            paths.mix_audio,
-            cfg,
-            output_path=paths.transcript,
-        )
-        result["session_id"] = paths.session_id
-        save_transcript_data(paths.transcript, result)
-        logger.info("Транскрипция завершена: %s (%d сегментов)", paths.transcript, len(result["segments"]))
-
-        # Протокол + Summary + Highlights + HTML
-        print("📋 Отчёт…")
-        protocol_path, summary_path = run_report(cfg, paths)
-
-        print(f"\n✅ Готово! Артефакты в: {paths.dir}")
-        print(f"   Протокол: {protocol_path}")
-        print(f"   Summary:  {summary_path}")
-
+        _, protocol_path, summary_path = process_session(cfg, paths)
     except Exception as e:
         logger.error("Ошибка пайплайна: %s", e, exc_info=True)
         print(f"\n❌ Ошибка: {e}")
         print(f"   Медиафайлы сохранены: {paths.dir}")
-        print(f"   Попробуйте перегенерировать: mrec report {paths.session_id}")
+        print(f"   Попробуйте перегенерировать: mrec process {paths.session_id}")
+        return
+
+    print(f"\n✅ Готово! Артефакты в: {paths.dir}")
+    print(f"   Протокол: {protocol_path}")
+    print(f"   Summary:  {summary_path}")
 
 
 @cli.command("process")
@@ -430,7 +559,7 @@ def process_cmd(ctx, session_id: str):
 
     try:
         transcript, protocol, summary = run_process(cfg, session_id)
-    except PipelineError as e:
+    except _USER_ERRORS as e:
         print(f"❌ Ошибка: {e}")
         sys.exit(1)
 
@@ -448,7 +577,7 @@ def report_cmd(ctx, session_id: str):
 
     try:
         protocol, summary = run_report_only(cfg, session_id)
-    except PipelineError as e:
+    except _USER_ERRORS as e:
         print(f"❌ Ошибка: {e}")
         sys.exit(1)
 
@@ -457,14 +586,33 @@ def report_cmd(ctx, session_id: str):
     print(f"   Summary:  {summary}")
 
 
+# ---------------------------------------------------------------------------
+# Чат
+# ---------------------------------------------------------------------------
+
+_CHAT_PROMPT_SHARE = (
+    0.7  # доля входного бюджета под системный промпт; остальное — история
+)
+
+
 def _build_chat_system_prompt(paths, cfg) -> str:
-    """Сформировать системный промпт для чата по данным встречи."""
-    import json as _json
+    """Сформировать системный промпт для чата по данным встречи.
+
+    Промпт укладывается в контекстное окно модели (llm.context_tokens): если
+    транскрипт не помещается целиком, он обрезается с явной пометкой, а summary
+    и ключевые моменты (компактные) включаются всегда.
+    """
     from datetime import datetime
+
+    from meeting_recorder.report import _CHARS_PER_TOKEN, _format_timestamp
+    from meeting_recorder.session_utils import (
+        load_highlights,
+        transcript_lines,
+        unique_speakers,
+    )
 
     session_id = paths.session_id
     try:
-        # Поддержка суффиксных ID: meeting_YYYY-MM-DD_HH-MM-SS[_N]
         parts = session_id.split("_")
         meeting_dt = datetime.strptime(f"{parts[1]}_{parts[2]}", "%Y-%m-%d_%H-%M-%S")
         date_str = meeting_dt.strftime("%Y-%m-%d")
@@ -472,48 +620,81 @@ def _build_chat_system_prompt(paths, cfg) -> str:
     except Exception:
         date_str = time_str = "?"
 
-    lines = [
-        "Ты — аналитик встречи. Отвечай на вопросы пользователя строго по данным встречи ниже.",
-        "Если информации нет в материалах — скажи об этом прямо. Отвечай на том же языке, на котором задан вопрос.",
+    header = [
+        "Ты — аналитик встречи. Отвечай на вопросы пользователя строго "
+        "по данным встречи ниже.",
+        "Если информации нет в материалах — скажи об этом прямо. "
+        "Отвечай на том же языке, на котором задан вопрос.",
         "",
-        f"## Метаданные",
+        "## Метаданные",
         f"Сессия: {session_id}",
         f"Дата: {date_str}  Время: {time_str}",
     ]
+    tail: list[str] = []
 
-    # Транскрипт
-    if paths.transcript.exists():
-        data = _json.loads(paths.transcript.read_text(encoding="utf-8"))
-        segments = data.get("segments", [])
-        duration_min = data.get("duration_sec", 0) / 60
-        lines.append(f"Длительность: {duration_min:.0f} мин")
-
-        speaker_names = cfg.transcription.speaker_names
-        unique_speakers = sorted({seg.get("speaker", "UNKNOWN") for seg in segments})
-        named = [speaker_names.get(s, s) for s in unique_speakers]
-        lines.append(f"Участники: {', '.join(named)}")
-        lines += ["", "## Транскрипт"]
-
-        for seg in segments:
-            speaker = seg.get("speaker", "UNKNOWN")
-            speaker = speaker_names.get(speaker, speaker)
-            start = int(seg["start"])
-            ts = f"{start // 60:02d}:{start % 60:02d}"
-            lines.append(f"[{ts}] {speaker}: {seg['text'].strip()}")
-    else:
-        lines.append("Длительность: ?")
-
-    # Протокол (только если нет транскрипта или как дополнение)
-    if paths.protocol.exists() and not paths.transcript.exists():
-        lines += ["", "## Протокол"]
-        lines.append(paths.protocol.read_text(encoding="utf-8"))
-
-    # Summary
     if paths.summary.exists():
-        lines += ["", "## Summary"]
-        lines.append(paths.summary.read_text(encoding="utf-8"))
+        tail += ["", "## Summary", paths.summary.read_text(encoding="utf-8")]
+    highlights = load_highlights(paths.highlights)
+    if highlights:
+        tail += ["", "## Ключевые моменты"]
+        tail += [
+            f"[{_format_timestamp(h['start'])}] {h['title']}: {h['description']}"
+            for h in highlights
+        ]
 
-    return "\n".join(lines)
+    body: list[str] = []
+    if paths.transcript.exists():
+        data = json.loads(paths.transcript.read_text(encoding="utf-8"))
+        segments = data.get("segments", [])
+        names = cfg.transcription.speaker_names
+        header.append(f"Длительность: {data.get('duration_sec', 0) / 60:.0f} мин")
+        header.append(f"Участники: {', '.join(unique_speakers(segments, names))}")
+        lines = transcript_lines(
+            segments, speaker_names=names, timestamp_formatter=_format_timestamp
+        )
+
+        budget_chars = int(
+            cfg.llm.input_token_budget() * _CHAT_PROMPT_SHARE * _CHARS_PER_TOKEN
+        ) - sum(len(x) + 1 for x in header + tail)
+        kept: list[str] = []
+        used = 0
+        for line in lines:
+            if used + len(line) + 1 > budget_chars:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        body += ["", "## Транскрипт"] + kept
+        if len(kept) < len(lines):
+            cut_at = kept[-1].split("]")[0].lstrip("[") if kept else "00:00"
+            logger.warning(
+                "Транскрипт не помещается в контекст модели: включено %d из %d реплик",
+                len(kept),
+                len(lines),
+            )
+            body.append(
+                f"[Транскрипт обрезан после {cut_at} из-за размера контекстного окна; "
+                "для более поздней части опирайся на summary и ключевые моменты.]"
+            )
+    else:
+        header.append("Длительность: ?")
+        if paths.protocol.exists():
+            body += ["", "## Протокол", paths.protocol.read_text(encoding="utf-8")]
+
+    return "\n".join(header + body + tail)
+
+
+def _trim_history(history: list[dict[str, str]], budget_tokens: int) -> None:
+    """Удалить самые старые реплики диалога, чтобы история влезла в бюджет.
+
+    Системный промпт (history[0]) и последний вопрос пользователя сохраняются.
+    """
+    from meeting_recorder.report import estimate_tokens
+
+    def total() -> int:
+        return sum(estimate_tokens(m["content"]) for m in history)
+
+    while len(history) > 2 and total() > budget_tokens:
+        del history[1]
 
 
 @cli.command("chat")
@@ -560,10 +741,11 @@ def chat_cmd(ctx, session_id: str | None):
         ctx_parts.append("summary")
     print(f"   Контекст: {', '.join(ctx_parts)}")
     print(f"   Модель:   {cfg.llm.model}")
-    print(f"   Для выхода введите 'exit' или нажмите Ctrl+C\n")
+    print("   Для выхода введите 'exit' или нажмите Ctrl+C\n")
 
     system_prompt = _build_chat_system_prompt(paths, cfg)
     history: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    budget = cfg.llm.input_token_budget()
 
     try:
         client = create_llm_client(cfg.llm, check_health=True)
@@ -586,6 +768,7 @@ def chat_cmd(ctx, session_id: str | None):
                 break
 
             history.append({"role": "user", "content": user_input})
+            _trim_history(history, budget)
 
             try:
                 answer = client.chat(history)
@@ -608,8 +791,6 @@ def mux_cmd(ctx, session_id: str | None):
 
     SESSION_ID — идентификатор сессии (по умолчанию последняя).
     """
-    from meeting_recorder.recorder import mux_video
-
     cfg = ctx.obj["cfg"]
 
     if session_id is None:
@@ -636,7 +817,7 @@ def mux_cmd(ctx, session_id: str | None):
 
     print(f"🎬 Свожу видео + аудио → {paths.final_video.name}…")
     try:
-        out = mux_video(paths.video, paths.mix_audio, paths.final_video)
+        out = run_mux(cfg, paths, force=True)
         size_mb = out.stat().st_size / 1024 / 1024
         print(f"✅ Готово: {out}  ({size_mb:.1f} МБ)")
     except Exception as e:
@@ -655,12 +836,16 @@ def list_cmd(ctx):
         print(f"Сессий не найдено в {cfg.output_dir}")
         return
 
-    print(f"\n{'Session ID':<35} {'Дата':<12} {'Файлы':>5}")
-    print("-" * 60)
+    print(f"\n{'Session ID':<35} {'Дата':<20} {'Файлы':>5}")
+    print("-" * 70)
     for s in sessions:
-        file_count = sum(1 for f in s.dir.iterdir() if f.is_file()) if s.dir.exists() else 0
-        date_part = s.session_id.split("_", 1)[1] if "_" in s.session_id else s.session_id
-        print(f"{s.session_id:<35} {date_part:<12} {file_count:>5} файлов")
+        file_count = (
+            sum(1 for f in s.dir.iterdir() if f.is_file()) if s.dir.exists() else 0
+        )
+        date_part = (
+            s.session_id.split("_", 1)[1] if "_" in s.session_id else s.session_id
+        )
+        print(f"{s.session_id:<35} {date_part:<20} {file_count:>5} файлов")
     print()
 
 
@@ -682,7 +867,8 @@ def tray_cmd(ctx):
 
     cfg = ctx.obj["cfg"]
     from meeting_recorder.tray import TrayApp
-    TrayApp(cfg).run()
+
+    TrayApp(cfg, config_path=resolve_config_path(ctx.obj.get("config_path"))).run()
 
 
 @cli.command("highlights")
@@ -708,7 +894,7 @@ def highlights_cmd(ctx, session_id: str | None):
     print("⭐ Генерирую ключевые моменты…")
     try:
         highlights_path = run_highlights_only(cfg, session_id)
-    except PipelineError as e:
+    except _USER_ERRORS as e:
         print(f"❌ Ошибка: {e}")
         sys.exit(1)
 
@@ -738,7 +924,7 @@ def html_cmd(ctx, session_id: str | None):
 
     try:
         html_path = run_html(cfg, session_id)
-    except PipelineError as e:
+    except _USER_ERRORS as e:
         print(f"❌ Ошибка: {e}")
         sys.exit(1)
 
@@ -749,7 +935,12 @@ def html_cmd(ctx, session_id: str | None):
 @cli.command("serve")
 @click.option("--host", default="127.0.0.1", show_default=True, help="Хост сервера")
 @click.option("--port", default=7070, show_default=True, type=int, help="Порт сервера")
-@click.option("--open/--no-open", "open_browser", default=True, help="Открыть браузер автоматически")
+@click.option(
+    "--open/--no-open",
+    "open_browser",
+    default=True,
+    help="Открыть браузер автоматически",
+)
 @click.pass_context
 def serve_cmd(ctx, host: str, port: int, open_browser: bool):
     """Запустить локальный веб-дашборд для просмотра встреч.
@@ -761,40 +952,53 @@ def serve_cmd(ctx, host: str, port: int, open_browser: bool):
         import uvicorn
     except ImportError:
         print("❌ uvicorn не установлен.")
-        print("   Установите: pip install \"meeting-recorder[web]\"")
+        print('   Установите: pip install "meeting-recorder[web]"')
         sys.exit(1)
 
     try:
         from fastapi.templating import Jinja2Templates  # noqa: F401
     except ImportError:
         print("❌ FastAPI или Jinja2 не установлены.")
-        print("   Установите: pip install \"meeting-recorder[web]\"")
+        print('   Установите: pip install "meeting-recorder[web]"')
         sys.exit(1)
 
     cfg = ctx.obj["cfg"]
     from meeting_recorder.dashboard import create_app
 
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("⚠️ Дашборд доступен из сети: аутентификации нет, встречи увидит любой.")
+
     url = f"http://{host}:{port}"
     print(f"\n🌐 Дашборд: {url}")
     print(f"   Встречи:  {cfg.output_dir}")
-    print(f"   Остановить: Ctrl+C\n")
+    print("   Остановить: Ctrl+C\n")
 
     if open_browser:
         import threading
         import webbrowser
+
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
-    app = create_app(cfg)
+    app = create_app(cfg, allowed_hosts=None if host in ("0.0.0.0", "::") else [host])
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 @cli.command("generate-config")
-@click.option("--output", "-o", type=click.Path(), default="config.yaml", help="Путь для сохранения конфига")
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    default="config.yaml",
+    help="Путь для сохранения конфига",
+)
 def generate_config_cmd(output: str):
-    """Сгенерировать шаблон config.yaml."""
+    """Сгенерировать шаблон config.yaml.
+
+    Секреты из переменных окружения (HF_TOKEN, LLM_API_KEY) в файл не попадают.
+    """
     from meeting_recorder.config import save_config
-    cfg = AppConfig()
-    save_config(cfg, output)
+
+    save_config(AppConfig(), output)
     print(f"Шаблон config.yaml сохранён: {output}")
     print("Отредактируйте его перед использованием.")
 

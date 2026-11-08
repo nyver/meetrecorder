@@ -3,13 +3,36 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import tempfile
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .naming import SessionPaths
 
+logger = logging.getLogger(__name__)
 
 TranscriptSource = dict[str, Any] | Path | str
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Записать файл атомарно: во временный файл рядом + os.replace.
+
+    При падении процесса во время записи исходный файл остаётся целым.
+    """
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def load_transcript_data(transcript: TranscriptSource) -> dict[str, Any]:
@@ -25,10 +48,63 @@ def load_transcript_data(transcript: TranscriptSource) -> dict[str, Any]:
 
 def save_transcript_data(path: Path, data: dict[str, Any]) -> None:
     """Write transcript JSON with the project's standard formatting."""
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def parse_seconds(value: Any) -> float:
+    """Привести таймкод к секундам: 12.5, "12.5", "05:30", "01:02:03" → float.
+
+    Некорректные значения дают 0.0 — LLM иногда возвращает таймкоды строками.
+    """
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return max(float(value), 0.0)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            if ":" in text:
+                total = 0.0
+                for part in text.split(":"):
+                    total = total * 60 + float(part)
+                return max(total, 0.0)
+            return max(float(text), 0.0)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def normalize_highlights(raw: Any) -> list[dict[str, Any]]:
+    """Отфильтровать и нормализовать список highlights из ответа LLM / файла.
+
+    Каждый элемент приводится к виду {title: str, description: str, start: float};
+    элементы не-словари отбрасываются.
+    """
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                "title": str(item.get("title", "") or ""),
+                "description": str(item.get("description", "") or ""),
+                "start": parse_seconds(item.get("start", 0)),
+            }
+        )
+    return result
+
+
+def load_highlights(path: Path) -> list[dict[str, Any]]:
+    """Прочитать *_highlights.json; при отсутствии или ошибке — пустой список."""
+    if not path.exists():
+        return []
+    try:
+        return normalize_highlights(json.loads(path.read_text(encoding="utf-8")))
+    except Exception as exc:
+        logger.warning("Не удалось загрузить highlights %s: %s", path, exc)
+        return []
 
 
 def normalize_segments(
@@ -69,7 +145,9 @@ def unique_speakers(
     speaker_names: dict[str, str] | None = None,
 ) -> list[str]:
     """Return sorted speaker names after aliasing."""
-    return sorted({seg["speaker"] for seg in normalize_segments(segments, speaker_names)})
+    return sorted(
+        {seg["speaker"] for seg in normalize_segments(segments, speaker_names)}
+    )
 
 
 def pick_media(paths: SessionPaths, *, mime: bool = True) -> tuple[str, str] | None:

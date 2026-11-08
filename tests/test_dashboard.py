@@ -1,4 +1,5 @@
 """Тесты для dashboard.py — FastAPI веб-дашборд."""
+
 from __future__ import annotations
 
 import json
@@ -16,6 +17,7 @@ pytest.importorskip("fastapi", reason="fastapi not installed")
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def cfg(tmp_path) -> AppConfig:
     c = AppConfig()
@@ -26,12 +28,14 @@ def cfg(tmp_path) -> AppConfig:
 @pytest.fixture
 def app(cfg):
     from meeting_recorder.dashboard import create_app
+
     return create_app(cfg)
 
 
 @pytest.fixture
 def client(app):
     from fastapi.testclient import TestClient
+
     return TestClient(app)
 
 
@@ -53,22 +57,37 @@ def _make_session(
             "duration_sec": 120.0,
             "segments": [
                 {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00", "text": "Привет."},
-                {"start": 5.0, "end": 10.0, "speaker": "SPEAKER_01", "text": "Здравствуй."},
+                {
+                    "start": 5.0,
+                    "end": 10.0,
+                    "speaker": "SPEAKER_01",
+                    "text": "Здравствуй.",
+                },
             ],
         }
-        paths.transcript.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        paths.transcript.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
     if summary:
         paths.summary.write_text(
             "# Summary\n\n## Краткое резюме\n\nКоманда обсудила план и утвердила бюджет.\n\n## Темы\n- Тема 1",
             encoding="utf-8",
         )
     if protocol:
-        paths.protocol.write_text("# Протокол\n\n**[00:00]** SPEAKER_00: Привет.", encoding="utf-8")
+        paths.protocol.write_text(
+            "# Протокол\n\n**[00:00]** SPEAKER_00: Привет.", encoding="utf-8"
+        )
     if highlights:
         hl = [
-            {"title": "Ключевое решение", "description": "Утвердили бюджет Q3.", "start": 30.0},
+            {
+                "title": "Ключевое решение",
+                "description": "Утвердили бюджет Q3.",
+                "start": 30.0,
+            },
         ]
-        paths.highlights.write_text(json.dumps(hl, ensure_ascii=False), encoding="utf-8")
+        paths.highlights.write_text(
+            json.dumps(hl, ensure_ascii=False), encoding="utf-8"
+        )
     if video:
         paths.final_video.write_bytes(b"fake_mp4_data_" * 10)
     if mix_audio:
@@ -79,6 +98,7 @@ def _make_session(
 # ---------------------------------------------------------------------------
 # GET /  — список сессий
 # ---------------------------------------------------------------------------
+
 
 class TestIndexRoute:
     def test_empty_returns_200(self, client):
@@ -127,6 +147,7 @@ class TestIndexRoute:
 # ---------------------------------------------------------------------------
 # GET /session/{session_id} — детали сессии
 # ---------------------------------------------------------------------------
+
 
 class TestSessionRoute:
     def test_not_found(self, client):
@@ -178,7 +199,14 @@ class TestSessionRoute:
         assert "audio" in resp.text
 
     def test_all_artifacts(self, cfg, client):
-        s = _make_session(cfg, transcript=True, summary=True, protocol=True, highlights=True, video=True)
+        s = _make_session(
+            cfg,
+            transcript=True,
+            summary=True,
+            protocol=True,
+            highlights=True,
+            video=True,
+        )
         resp = client.get(f"/session/{s.session_id}")
         assert resp.status_code == 200
 
@@ -193,7 +221,9 @@ class TestSessionRoute:
         cfg.transcription.speaker_names = {"SPEAKER_00": "Иван", "SPEAKER_01": "Мария"}
         # пересоздаём app и client с новым cfg
         from fastapi.testclient import TestClient
+
         from meeting_recorder.dashboard import create_app
+
         local_client = TestClient(create_app(cfg))
         s = _make_session(cfg, transcript=True)
         resp = local_client.get(f"/session/{s.session_id}")
@@ -204,6 +234,7 @@ class TestSessionRoute:
 # ---------------------------------------------------------------------------
 # GET /media/{session_id}/{filename} — стриминг файлов
 # ---------------------------------------------------------------------------
+
 
 class TestMediaRoute:
     def test_session_not_found(self, client):
@@ -240,24 +271,93 @@ class TestMediaRoute:
 # _session_meta — вспомогательные сценарии
 # ---------------------------------------------------------------------------
 
+
 class TestSessionMeta:
     def test_empty_session_meta(self, cfg, client):
         """Сессия без файлов — статус 'Пусто'."""
-        s = _make_session(cfg)
+        _make_session(cfg)
         resp = client.get("/")
         assert "Пусто" in resp.text
 
     def test_size_mb_shown(self, cfg, client):
-        s = _make_session(cfg, video=True)
+        _make_session(cfg, video=True)
         resp = client.get("/")
         assert "МБ" in resp.text
 
     def test_duration_shown(self, cfg, client):
-        s = _make_session(cfg, transcript=True)
+        _make_session(cfg, transcript=True)
         resp = client.get("/")
         assert "мин" in resp.text
 
     def test_speakers_shown(self, cfg, client):
-        s = _make_session(cfg, transcript=True)
+        _make_session(cfg, transcript=True)
         resp = client.get("/")
         assert "SPEAKER" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Безопасность: path traversal и DNS rebinding
+# ---------------------------------------------------------------------------
+
+
+class TestMediaTraversal:
+    @pytest.fixture
+    def nested(self, tmp_path):
+        out = tmp_path / "out"
+        s = create_session(str(out))
+        (tmp_path / "secret.txt").write_text("TOP-SECRET", encoding="utf-8")
+        (s.dir / "ok.wav").write_bytes(b"RIFF")
+        cfg = AppConfig()
+        cfg.output_dir = str(out)
+        from fastapi.testclient import TestClient
+
+        from meeting_recorder.dashboard import create_app
+
+        return TestClient(create_app(cfg)), s
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "/media/%2E%2E/secret.txt",
+            "/media/..%5C..%5C/secret.txt",
+            "/media/..%5C/secret.txt",
+        ],
+    )
+    def test_session_id_traversal_blocked(self, nested, url):
+        client, _ = nested
+        resp = client.get(url)
+        assert resp.status_code in (403, 404)
+        assert "TOP-SECRET" not in resp.text
+
+    def test_filename_traversal_blocked(self, nested):
+        client, s = nested
+        resp = client.get(f"/media/{s.session_id}/..%5C..%5Csecret.txt")
+        assert resp.status_code in (403, 404)
+        assert "TOP-SECRET" not in resp.text
+
+    def test_session_view_traversal_blocked(self, nested):
+        client, _ = nested
+        assert client.get("/session/%2E%2E").status_code == 404
+
+    def test_legit_file_served(self, nested):
+        client, s = nested
+        resp = client.get(f"/media/{s.session_id}/ok.wav")
+        assert resp.status_code == 200
+        assert resp.content == b"RIFF"
+
+    def test_directory_not_served(self, nested):
+        client, s = nested
+        (s.dir / "sub").mkdir()
+        assert client.get(f"/media/{s.session_id}/sub").status_code == 404
+
+
+class TestTrustedHosts:
+    def test_foreign_host_rejected(self, cfg):
+        from fastapi.testclient import TestClient
+
+        from meeting_recorder.dashboard import create_app
+
+        client = TestClient(create_app(cfg, allowed_hosts=["127.0.0.1"]))
+        assert client.get("/", headers={"host": "evil.example.com"}).status_code == 400
+        assert client.get("/", headers={"host": "127.0.0.1:7070"}).status_code == 200
+        assert client.get("/", headers={"host": "localhost"}).status_code == 200

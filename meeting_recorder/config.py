@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, SecretStr, model_validator
 
 # ---------------------------------------------------------------------------
 # Pydantic-модели
@@ -24,9 +24,13 @@ class RecordingConfig(BaseModel):
     record_mic: bool = True
     mic_device: str = ""  # "" — автодетект первого dshow capture-устройства
     system_audio_device: str = "virtual-audio-capturer"
+    # Устройство вывода для grabber="soundcard": id или имя; "" — по умолчанию
+    system_audio_speaker: str = ""
     system_audio_grabber: Literal["dshow", "wasapi", "soundcard"] = "soundcard"
     record_system_audio: bool = True
     screen_grabber: Literal["ddagrab", "gdigrab"] = "gdigrab"
+    # Сводить видео + mix-аудио в *_final.mp4 при генерации отчёта
+    auto_mux: bool = True
 
 
 class TranscriptionConfig(BaseModel):
@@ -43,14 +47,20 @@ class TranscriptionConfig(BaseModel):
     batch_size: int = Field(default=0, ge=0)
     hf_token: SecretStr = Field(default=SecretStr(""))
     speaker_names: dict[str, str] = Field(default_factory=dict)
+    # False — выгружать модели после обработки (освобождает VRAM в режиме трея)
+    keep_models_loaded: bool = False
+
+    # Секрет взят из переменной окружения — не сохраняем его в YAML
+    _secret_from_env: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
-    def _resolve_hf_token(self) -> "TranscriptionConfig":
+    def _resolve_hf_token(self) -> TranscriptionConfig:
         if self.hf_token.get_secret_value():
             return self
         env = os.environ.get("HF_TOKEN", "").strip()
         if env:
             self.hf_token = SecretStr(env)
+            self._secret_from_env = True
         return self
 
 
@@ -65,15 +75,27 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(default=16384, gt=0)
     clean_protocol: bool = False
     timeout: float = Field(default=300.0, gt=0)
+    # Размер контекстного окна модели (вход + выход), токенов
+    context_tokens: int = Field(default=32768, ge=2048)
+    # Повторы при 429 / 5xx / сетевых сбоях
+    max_retries: int = Field(default=2, ge=0, le=10)
+
+    _secret_from_env: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
-    def _resolve_api_key(self) -> "LLMConfig":
+    def _resolve_api_key(self) -> LLMConfig:
         if self.api_key.get_secret_value():
             return self
         env = os.environ.get("LLM_API_KEY", "").strip()
         if env:
             self.api_key = SecretStr(env)
+            self._secret_from_env = True
         return self
+
+    def input_token_budget(self) -> int:
+        """Сколько токенов можно отдать под промпт, оставив место под ответ."""
+        reserve = min(self.max_tokens, self.context_tokens // 2)
+        return max(self.context_tokens - reserve - 1024, 1024)
 
 
 class AppConfig(BaseModel):
@@ -88,6 +110,7 @@ class AppConfig(BaseModel):
 # ---------------------------------------------------------------------------
 # Функции загрузки
 # ---------------------------------------------------------------------------
+
 
 def _default_config_path() -> Path:
     # Editable/dev install: config.yaml рядом с корнем проекта — используем его
@@ -106,9 +129,14 @@ def _default_config_path() -> Path:
 _CONFIG_FILE = _default_config_path()
 
 
+def resolve_config_path(path: Path | str | None = None) -> Path:
+    """Вернуть фактический путь к конфигу: явный или путь по умолчанию."""
+    return Path(path) if path else _CONFIG_FILE
+
+
 def load_config(path: Path | str | None = None) -> AppConfig:
     """Загрузить и валидировать конфиг из YAML-файла."""
-    config_path = Path(path) if path else _CONFIG_FILE
+    config_path = resolve_config_path(path)
     if not config_path.exists():
         # Если файла нет — вернуть дефолты
         return AppConfig()
@@ -134,18 +162,61 @@ def _reveal_secrets(d: dict) -> dict:
     return result
 
 
-def save_config(cfg: AppConfig, path: Path | str | None = None) -> None:
-    """Сохранить конфиг в YAML-файл."""
-    config_path = Path(path) if path else _CONFIG_FILE
-    raw = cfg.model_dump(exclude_none=True)
-    data = _reveal_secrets(raw)
-    config_path.write_text(
-        yaml.dump(
-            data,
-            default_flow_style=False,
-            allow_unicode=True,
-            indent=2,
-            sort_keys=False,
-        ),
-        encoding="utf-8",
+def _dump_yaml(data: dict) -> str:
+    return yaml.dump(
+        data,
+        default_flow_style=False,
+        allow_unicode=True,
+        indent=2,
+        sort_keys=False,
     )
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    from .session_utils import atomic_write_text
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, text)
+
+
+def save_config(cfg: AppConfig, path: Path | str | None = None) -> None:
+    """Сохранить конфиг в YAML-файл целиком.
+
+    Секреты, подставленные из переменных окружения (HF_TOKEN, LLM_API_KEY),
+    в файл не записываются. Запись атомарная.
+    """
+    config_path = resolve_config_path(path)
+    raw = cfg.model_dump(exclude_none=True)
+    if cfg.transcription._secret_from_env:
+        raw["transcription"].pop("hf_token", None)
+    if cfg.llm._secret_from_env:
+        raw["llm"].pop("api_key", None)
+    _atomic_write(config_path, _dump_yaml(_reveal_secrets(raw)))
+
+
+def _deep_merge(base: dict, updates: dict) -> dict:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def update_config_file(updates: dict[str, Any], path: Path | str | None = None) -> None:
+    """Точечно обновить ключи в YAML-конфиге, не трогая остальное содержимое.
+
+    В отличие от save_config не переписывает весь конфиг из модели: значения,
+    которых нет в updates (в т.ч. секреты), остаются как в файле. Результат
+    валидируется перед записью.
+
+    Пример: ``update_config_file({"recording": {"mic_device": "USB Mic"}})``.
+    """
+    config_path = resolve_config_path(path)
+    raw: dict = {}
+    if config_path.exists():
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    merged = _deep_merge(raw, updates)
+    AppConfig.model_validate(merged)  # не записываем невалидный конфиг
+    _atomic_write(config_path, _dump_yaml(merged))

@@ -16,10 +16,7 @@ dependencies = [
     "pydantic>=2.5,<3",
     "pyyaml>=6.0,<7",
     "httpx>=0.27,<1",
-    "openai>=1.10.0,<2",
     "click>=8.1,<9",
-    "rich>=13.0,<14",
-    "whisperx>=3.1.2,<4",
     "faster-whisper>=1.0.0,<2",
     "pyannote.audio>=3.1.0,<4",
     "torch>=2.1.0,<3",
@@ -33,6 +30,7 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "ruff>=0.6",
 ]
 audio = [
     "resampy>=0.4.0",
@@ -60,3 +58,16 @@ python_functions = ["test_*"]
 [tool.ruff]
 target-version = "py311"
 line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Тесты: длинные строки с тестовыми данными и pytest.raises(Exception) допустимы
+"tests/*" = ["E501", "B017"]
+
+[tool.coverage.run]
+source = ["meeting_recorder"]
+
+[tool.coverage.report]
+fail_under = 70

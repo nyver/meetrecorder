@@ -1,44 +1,50 @@
 """Тесты для recorder.py — mock subprocess и soundfile."""
+
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pytest
 import soundfile as sf
 
-from meeting_recorder.config import AppConfig, RecordingConfig
+from meeting_recorder.config import AppConfig
 from meeting_recorder.naming import SessionPaths
 from meeting_recorder.recorder import (
-    SystemAudioCapture,
+    _FFMPEG_GRACEFUL_STOP_TIMEOUT,
+    AudioDevice,
     MeetingRecorder,
+    SystemAudioCapture,
+    default_soundcard_speaker,
+    list_dshow_audio_devices,
+    list_soundcard_speakers,
     mix_audio_files,
     mux_video,
-    split_streams,
-    _FFMPEG_GRACEFUL_STOP_TIMEOUT,
-    _FFMPEG_FORCE_KILL_TIMEOUT,
-    _SYS_AUDIO_JOIN_TIMEOUT,
+    no_window_kwargs,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def tmp_session(tmp_path) -> SessionPaths:
-    sid = "meeting_2024-01-01_10-00-00"
-    d = tmp_path / sid
-    d.mkdir()
-    return SessionPaths(sid, d)
+    paths = SessionPaths(str(tmp_path), "meeting_2024-01-01_10-00-00")
+    paths.ensure_dir()
+    return paths
 
 
 @pytest.fixture
 def app_cfg(tmp_path) -> AppConfig:
     cfg = AppConfig()
     cfg.output_dir = str(tmp_path)
+    # Явное устройство: тесты не должны зависеть от реального ffmpeg и микрофонов
+    cfg.recording.mic_device = "Test Mic"
     return cfg
 
 
@@ -53,6 +59,7 @@ def _make_wav(path: Path, duration_sec: float = 1.0, sr: int = 48000) -> Path:
 # ---------------------------------------------------------------------------
 # SystemAudioCapture
 # ---------------------------------------------------------------------------
+
 
 class TestSystemAudioCapture:
     def test_chunk_frames_from_sample_rate(self):
@@ -109,8 +116,12 @@ class TestSystemAudioCapture:
 
     def test_record_error_stored(self, tmp_path):
         cap = SystemAudioCapture(tmp_path / "out.wav")
-        with patch("meeting_recorder.recorder.sf.write", side_effect=IOError("disk full")):
-            with patch("soundcard.default_speaker", side_effect=RuntimeError("no device")):
+        with patch(
+            "meeting_recorder.recorder.sf.write", side_effect=OSError("disk full")
+        ):
+            with patch(
+                "soundcard.default_speaker", side_effect=RuntimeError("no device")
+            ):
                 cap._record()
         assert cap.error is not None
         assert "no device" in str(cap.error)
@@ -119,6 +130,7 @@ class TestSystemAudioCapture:
 # ---------------------------------------------------------------------------
 # mix_audio_files
 # ---------------------------------------------------------------------------
+
 
 class TestMixAudioFiles:
     def test_equal_length(self, tmp_path):
@@ -165,6 +177,7 @@ class TestMixAudioFiles:
 # ---------------------------------------------------------------------------
 # MeetingRecorder
 # ---------------------------------------------------------------------------
+
 
 def _make_mock_process(poll_return=None, pid=12345):
     proc = MagicMock()
@@ -241,7 +254,10 @@ class TestMeetingRecorderStart:
         proc = _make_mock_process(poll_return=None)
 
         with patch("meeting_recorder.recorder.subprocess.Popen", return_value=proc):
-            with patch("meeting_recorder.recorder.SystemAudioCapture", return_value=mock_capture):
+            with patch(
+                "meeting_recorder.recorder.SystemAudioCapture",
+                return_value=mock_capture,
+            ):
                 with patch("meeting_recorder.recorder._FFMPEG_STARTUP_TIMEOUT", 0.3):
                     with patch("meeting_recorder.recorder._FFMPEG_STARTUP_POLL", 0.1):
                         with pytest.raises(RuntimeError, match="системного аудио"):
@@ -250,7 +266,9 @@ class TestMeetingRecorderStart:
 
 
 class TestMeetingRecorderStop:
-    def _started_recorder(self, app_cfg, tmp_session) -> tuple[MeetingRecorder, MagicMock]:
+    def _started_recorder(
+        self, app_cfg, tmp_session
+    ) -> tuple[MeetingRecorder, MagicMock]:
         app_cfg.recording.record_system_audio = False
         r = MeetingRecorder(app_cfg, tmp_session)
         proc = _make_mock_process(poll_return=None)
@@ -272,7 +290,9 @@ class TestMeetingRecorderStop:
     def test_stop_timeout_kills(self, app_cfg, tmp_session):
         r, proc = self._started_recorder(app_cfg, tmp_session)
         proc.wait.side_effect = [
-            __import__("subprocess").TimeoutExpired("ffmpeg", _FFMPEG_GRACEFUL_STOP_TIMEOUT),
+            __import__("subprocess").TimeoutExpired(
+                "ffmpeg", _FFMPEG_GRACEFUL_STOP_TIMEOUT
+            ),
             None,
         ]
         r.stop()
@@ -281,8 +301,9 @@ class TestMeetingRecorderStop:
 
 
 # ---------------------------------------------------------------------------
-# mux_video / split_streams
+# mux_video
 # ---------------------------------------------------------------------------
+
 
 class TestMuxVideo:
     def test_mux_success(self, tmp_path):
@@ -307,20 +328,230 @@ class TestMuxVideo:
             with pytest.raises(RuntimeError, match="ffmpeg завершился"):
                 mux_video(video, audio, out)
 
-
-class TestSplitStreams:
-    def test_split_missing_file(self, tmp_path, tmp_session):
-        with pytest.raises(FileNotFoundError):
-            split_streams(tmp_path / "nonexistent.mp4", tmp_session)
-
-    def test_split_success(self, tmp_path, tmp_session):
-        video = tmp_path / "v.mp4"
-        video.write_bytes(b"fake")
+    def test_mux_uses_utf8_and_no_window(self, tmp_path):
         with patch("meeting_recorder.recorder.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            mic, sys_ = split_streams(video, tmp_session, sample_rate=16000)
-            assert mic == tmp_session.mic_audio
-            assert sys_ == tmp_session.system_audio
-            # проверяем что sample_rate передался в команду
-            calls_args = [str(a) for args in [c.args[0] for c in mock_run.call_args_list] for a in args]
-            assert "16000" in calls_args
+            mux_video(tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4")
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+
+
+# ---------------------------------------------------------------------------
+# Старт / стоп: очистка ресурсов
+# ---------------------------------------------------------------------------
+
+
+class TestStartCleanup:
+    def test_cmd_build_failure_does_not_start_sys_capture(self, app_cfg, tmp_session):
+        """Если микрофон не найден, поток системного звука не должен остаться работать."""
+        app_cfg.recording.mic_device = ""
+        app_cfg.recording.system_audio_grabber = "soundcard"
+        r = MeetingRecorder(app_cfg, tmp_session)
+        with patch(
+            "meeting_recorder.recorder.list_dshow_audio_devices", return_value=[]
+        ):
+            with patch("meeting_recorder.recorder.SystemAudioCapture") as mock_cap:
+                with pytest.raises(RuntimeError, match="dshow"):
+                    r.start()
+        mock_cap.assert_not_called()
+        assert not r.is_recording
+
+    def test_popen_failure_stops_sys_capture(self, app_cfg, tmp_session):
+        app_cfg.recording.system_audio_grabber = "soundcard"
+        r = MeetingRecorder(app_cfg, tmp_session)
+        cap = MagicMock()
+        with patch("meeting_recorder.recorder.SystemAudioCapture", return_value=cap):
+            with patch(
+                "meeting_recorder.recorder.subprocess.Popen",
+                side_effect=OSError("no ffmpeg"),
+            ):
+                with pytest.raises(OSError):
+                    r.start()
+        cap.start.assert_called_once()
+        cap.stop.assert_called_once()
+        assert r._stderr_file is None
+
+    def test_autodetect_mic(self, app_cfg, tmp_session):
+        app_cfg.recording.mic_device = ""
+        r = MeetingRecorder(app_cfg, tmp_session)
+        with patch(
+            "meeting_recorder.recorder.list_dshow_audio_devices",
+            return_value=["Mic A", "Mic B"],
+        ):
+            assert r._resolve_mic_device(app_cfg.recording) == "Mic A"
+
+    def test_stop_kills_when_terminate_hangs(self, app_cfg, tmp_session):
+        import subprocess
+
+        app_cfg.recording.record_system_audio = False
+        r = MeetingRecorder(app_cfg, tmp_session)
+        proc = _make_mock_process()
+        with patch("meeting_recorder.recorder.subprocess.Popen", return_value=proc):
+            with patch("meeting_recorder.recorder._FFMPEG_STARTUP_TIMEOUT", 0.0):
+                r.start()
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired("ffmpeg", 1),
+            subprocess.TimeoutExpired("ffmpeg", 1),
+            None,
+        ]
+        r.stop()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        assert not r.is_recording
+        assert r._stderr_file is None
+
+    def test_stop_resets_state_even_if_kill_fails(self, app_cfg, tmp_session):
+        import subprocess
+
+        app_cfg.recording.record_system_audio = False
+        r = MeetingRecorder(app_cfg, tmp_session)
+        proc = _make_mock_process()
+        with patch("meeting_recorder.recorder.subprocess.Popen", return_value=proc):
+            with patch("meeting_recorder.recorder._FFMPEG_STARTUP_TIMEOUT", 0.0):
+                r.start()
+        proc.wait.side_effect = subprocess.TimeoutExpired("ffmpeg", 1)
+        with pytest.raises(subprocess.TimeoutExpired):
+            r.stop()
+        assert not r.is_recording
+
+
+# ---------------------------------------------------------------------------
+# Список устройств
+# ---------------------------------------------------------------------------
+
+
+def _fake_soundcard(speakers, default=None):
+    sc = MagicMock()
+    sc.all_speakers.return_value = speakers
+    sc.default_speaker.return_value = default or (speakers[0] if speakers else None)
+    return sc
+
+
+def _speaker(id_, name):
+    sp = MagicMock()
+    sp.id = id_
+    sp.name = name
+    return sp
+
+
+class TestDeviceListing:
+    def test_list_dshow_parses_audio_devices(self):
+        stderr = (
+            '[dshow @ 0] "Integrated Camera" (video)\n'
+            '[dshow @ 0] "Microphone (Realtek)" (audio)\n'
+            '[dshow @ 0]   Alternative name "@device_cm_{X}"\n'
+            '[dshow @ 0] "virtual-audio-capturer" (audio)\n'
+        )
+        with patch("meeting_recorder.recorder.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stderr=stderr)
+            assert list_dshow_audio_devices() == [
+                "Microphone (Realtek)",
+                "virtual-audio-capturer",
+            ]
+
+    def test_list_dshow_error_returns_empty(self):
+        with patch(
+            "meeting_recorder.recorder.subprocess.run",
+            side_effect=FileNotFoundError("ffmpeg"),
+        ):
+            assert list_dshow_audio_devices() == []
+
+    def test_list_soundcard_speakers(self):
+        sc = _fake_soundcard(
+            [_speaker("{id-1}", "Speakers"), _speaker("{id-2}", "Headset")]
+        )
+        with patch.dict(sys.modules, {"soundcard": sc}):
+            devices = list_soundcard_speakers()
+        assert devices == [
+            AudioDevice("{id-1}", "Speakers"),
+            AudioDevice("{id-2}", "Headset"),
+        ]
+
+    def test_list_soundcard_speakers_error(self):
+        sc = MagicMock()
+        sc.all_speakers.side_effect = RuntimeError("COM error")
+        with patch.dict(sys.modules, {"soundcard": sc}):
+            assert list_soundcard_speakers() == []
+
+    def test_default_speaker(self):
+        sc = _fake_soundcard([_speaker("{id-1}", "Speakers")])
+        with patch.dict(sys.modules, {"soundcard": sc}):
+            assert default_soundcard_speaker() == AudioDevice("{id-1}", "Speakers")
+
+    def test_default_speaker_error(self):
+        sc = MagicMock()
+        sc.default_speaker.side_effect = RuntimeError("no device")
+        with patch.dict(sys.modules, {"soundcard": sc}):
+            assert default_soundcard_speaker() is None
+
+    def test_no_window_kwargs(self):
+        kwargs = no_window_kwargs()
+        if sys.platform == "win32":
+            assert "creationflags" in kwargs
+        else:
+            assert kwargs == {}
+
+
+class TestResolveSpeaker:
+    def test_by_id(self):
+        a, b = _speaker("{a}", "Same Name"), _speaker("{b}", "Same Name")
+        cap = SystemAudioCapture(Path("x.wav"), device="{b}")
+        assert cap._resolve_speaker(_fake_soundcard([a, b])) is b
+
+    def test_by_name(self):
+        a, b = _speaker("{a}", "Speakers"), _speaker("{b}", "Headset")
+        cap = SystemAudioCapture(Path("x.wav"), device="Headset")
+        assert cap._resolve_speaker(_fake_soundcard([a, b])) is b
+
+    def test_missing_falls_back_to_default(self):
+        a = _speaker("{a}", "Speakers")
+        cap = SystemAudioCapture(Path("x.wav"), device="Gone")
+        assert cap._resolve_speaker(_fake_soundcard([a], default=a)) is a
+
+    def test_empty_uses_default(self):
+        a = _speaker("{a}", "Speakers")
+        sc = _fake_soundcard([a], default=a)
+        cap = SystemAudioCapture(Path("x.wav"))
+        assert cap._resolve_speaker(sc) is a
+        sc.all_speakers.assert_not_called()
+
+
+class TestRecordGapPadding:
+    def test_gap_is_padded_with_silence(self, tmp_path):
+        """Разрыв захвата (поток не успел забрать данные) дополняется тишиной."""
+        sr = 1000
+        out = tmp_path / "sys.wav"
+        cap = SystemAudioCapture(out, sample_rate=sr)
+        chunk = np.ones((cap._chunk_frames, 1), dtype=np.float32) * 0.1
+
+        calls = {"n": 0}
+
+        def _record(numframes):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                cap.signal_stop()
+            return chunk
+
+        rec = MagicMock()
+        rec.record.side_effect = _record
+        rec.__enter__ = MagicMock(return_value=rec)
+        rec.__exit__ = MagicMock(return_value=False)
+        mic = MagicMock()
+        mic.recorder.return_value = rec
+        sc = _fake_soundcard([_speaker("{a}", "Speakers")])
+        sc.get_microphone.return_value = mic
+
+        # t0 = 0.0 - 0.1; затем «прошло» 2.1 с при записанных 0.2 с → разрыв ~1.9 с
+        times = iter([0.0, 0.1, 2.1, 2.2, 2.3, 2.4])
+        with patch.dict(sys.modules, {"soundcard": sc}):
+            with patch(
+                "meeting_recorder.recorder.time.monotonic",
+                side_effect=lambda: next(times),
+            ):
+                cap._record()
+
+        assert cap.error is None
+        data, _ = sf.read(str(out))
+        assert len(data) >= int(2.0 * sr)
+        assert np.count_nonzero(np.abs(data) < 1e-6) > sr  # вставлена тишина

@@ -12,15 +12,29 @@ from typing import Any
 from .config import AppConfig
 from .naming import SessionPaths
 from .report import _format_timestamp, _session_datetime
-from .session_utils import load_transcript_data, normalize_segments, pick_media
+from .session_utils import (
+    atomic_write_text,
+    load_highlights,
+    load_transcript_data,
+    normalize_highlights,
+    normalize_segments,
+    pick_media,
+)
 
 logger = logging.getLogger(__name__)
 
 # Палитра для говорящих (до 10 уникальных)
 _SPEAKER_COLORS = [
-    "#2563eb", "#16a34a", "#dc2626", "#9333ea",
-    "#ea580c", "#0891b2", "#db2777", "#65a30d",
-    "#b45309", "#0f766e",
+    "#2563eb",
+    "#16a34a",
+    "#dc2626",
+    "#9333ea",
+    "#ea580c",
+    "#0891b2",
+    "#db2777",
+    "#65a30d",
+    "#b45309",
+    "#0f766e",
 ]
 
 
@@ -28,14 +42,19 @@ _SPEAKER_COLORS = [
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+
 def _color_map(unique_speakers: list[str]) -> dict[str, str]:
-    return {sp: _SPEAKER_COLORS[i % len(_SPEAKER_COLORS)] for i, sp in enumerate(unique_speakers)}
+    return {
+        sp: _SPEAKER_COLORS[i % len(_SPEAKER_COLORS)]
+        for i, sp in enumerate(unique_speakers)
+    }
 
 
 def _pick_media(paths: SessionPaths) -> tuple[str, str] | None:
     """Выбрать лучший доступный медиафайл.
 
-    Приоритет: финальное видео (audio+video) → mix-аудио (есть звук) → сырое видео (без звука).
+    Приоритет: финальное видео (audio+video) → mix-аудио (есть звук) →
+    сырое видео (без звука).
     Сырое видео gdigrab не содержит аудио, поэтому mix_audio предпочтительнее.
     Возвращает (filename, mime_type) или None.
     """
@@ -56,7 +75,7 @@ def _md_to_html(text: str) -> str:
     out: list[str] = []
     in_ul = False
     in_table = False
-    table_has_header = False   # True после строки-разделителя |---|
+    table_has_header = False  # True после строки-разделителя |---|
 
     for raw in lines:
         stripped = raw.strip()
@@ -87,7 +106,9 @@ def _md_to_html(text: str) -> str:
 
         # Закрыть таблицу при первой не-табличной строке
         if in_table:
-            out.append("</thead></table>" if not table_has_header else "</tbody></table>")
+            out.append(
+                "</thead></table>" if not table_has_header else "</tbody></table>"
+            )
             in_table = False
             table_has_header = False
 
@@ -99,7 +120,7 @@ def _md_to_html(text: str) -> str:
                 if in_ul:
                     out.append("</ul>")
                     in_ul = False
-                out.append(f"<{tag}>{_inline(esc[len(prefix):])}</{tag}>")
+                out.append(f"<{tag}>{_inline(esc[len(prefix) :])}</{tag}>")
                 break
         else:
             if esc.startswith("- ") or esc.startswith("* "):
@@ -141,6 +162,7 @@ def _inline(text: str) -> str:
 # Публичный API
 # ---------------------------------------------------------------------------
 
+
 def generate_html_protocol(
     transcript: dict[str, Any] | Path | str,
     paths: SessionPaths,
@@ -169,32 +191,19 @@ def generate_html_protocol(
     unique_speakers = sorted({s["speaker"] for s in segments})
     colors = _color_map(unique_speakers)
 
-    meeting_dt  = _session_datetime(paths.session_id)
-    date_str    = meeting_dt.strftime("%Y-%m-%d %H:%M")
-    duration_s  = data.get("duration_sec", 0.0)
+    meeting_dt = _session_datetime(paths.session_id)
+    date_str = meeting_dt.strftime("%Y-%m-%d %H:%M")
+    duration_s = data.get("duration_sec", 0.0)
 
-    # Попытка создать финальное видео (видео + аудио), если его ещё нет
-    if not paths.final_video.exists() and paths.video.exists() and paths.mix_audio.exists():
-        try:
-            from .recorder import mux_video
-            logger.info("Создаю финальное видео для HTML-протокола…")
-            mux_video(paths.video, paths.mix_audio, paths.final_video)
-            logger.info("Финальное видео готово: %s", paths.final_video)
-        except Exception as exc:
-            logger.warning("Не удалось создать финальное видео: %s", exc)
-
+    # Финальное видео (видео + аудио) создаётся отдельным шагом пайплайна
+    # (pipeline.run_mux / recording.auto_mux); здесь только выбираем лучший файл.
     media = _pick_media(paths)
 
     summary_html = ""
     if paths.summary.exists():
         summary_html = _md_to_html(paths.summary.read_text(encoding="utf-8"))
 
-    highlights: list[dict] = []
-    if paths.highlights.exists():
-        try:
-            highlights = json.loads(paths.highlights.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning("Не удалось загрузить highlights: %s", exc)
+    highlights = load_highlights(paths.highlights)
 
     content = _render(
         session_id=paths.session_id,
@@ -208,7 +217,7 @@ def generate_html_protocol(
         highlights=highlights,
     )
 
-    paths.html_protocol.write_text(content, encoding="utf-8")
+    atomic_write_text(paths.html_protocol, content)
     logger.info("HTML-протокол сохранён: %s", paths.html_protocol)
     return paths.html_protocol
 
@@ -216,6 +225,7 @@ def generate_html_protocol(
 # ---------------------------------------------------------------------------
 # Рендер HTML
 # ---------------------------------------------------------------------------
+
 
 def _render(
     session_id: str,
@@ -237,7 +247,7 @@ def _render(
             f'<{tag} id="player" controls preload="metadata"'
             f' style="width:100%;display:block;max-height:420px">'
             f'<source src="{html.escape(fname)}" type="{html.escape(mime)}">'
-            f'</{tag}>'
+            f"</{tag}>"
         )
         seek_js = (
             "function seek(t){"
@@ -258,7 +268,7 @@ def _render(
     # --- блок summary ---
     if summary_html:
         summary_block = (
-            '<details open><summary>&#128196; Summary</summary>'
+            "<details open><summary>&#128196; Summary</summary>"
             f'<div class="sum-body">{summary_html}</div></details>'
         )
     else:
@@ -267,8 +277,8 @@ def _render(
     # --- блок highlights ---
     if highlights:
         hl_items = []
-        for i, h in enumerate(highlights, 1):
-            t = float(h.get("start", 0))
+        for i, h in enumerate(normalize_highlights(highlights), 1):
+            t = h["start"]
             ts = _format_timestamp(t)
             title = html.escape(h.get("title", ""))
             desc = html.escape(h.get("description", ""))
@@ -278,14 +288,14 @@ def _render(
                 f'<span class="hl-num">{i}</span>'
                 f'<span class="hl-title">{title}</span>'
                 f'<button class="hl-ts" onclick="seek({t:.2f})">'
-                f'&#9654; {ts}</button>'
-                f'</div>'
+                f"&#9654; {ts}</button>"
+                f"</div>"
                 f'<p class="hl-desc">{desc}</p>'
-                f'</div>'
+                f"</div>"
             )
         highlights_block = (
-            '<details open><summary>&#11088; Ключевые моменты</summary>'
-            '<div class="hl-body">' + "".join(hl_items) + '</div></details>'
+            "<details open><summary>&#11088; Ключевые моменты</summary>"
+            '<div class="hl-body">' + "".join(hl_items) + "</div></details>"
         )
     else:
         highlights_block = ""
@@ -296,7 +306,7 @@ def _render(
         f'style="border-color:{colors[sp]};color:{colors[sp]}" '
         f'data-sp="{html.escape(sp)}" '
         f'onclick="toggleSp(this)">'
-        f'{html.escape(sp)}</button>'
+        f"{html.escape(sp)}</button>"
         for sp in unique_speakers
     )
 
@@ -304,9 +314,9 @@ def _render(
     rows = []
     for seg in segments:
         t_start = seg["start"]
-        t_end   = seg["end"]
-        sp      = seg["speaker"]
-        color   = colors.get(sp, "#333")
+        t_end = seg["end"]
+        sp = seg["speaker"]
+        color = colors.get(sp, "#333")
         rows.append(
             f'<div class="seg" '
             f'data-start="{t_start:.2f}" data-end="{t_end:.2f}" '
@@ -315,7 +325,7 @@ def _render(
             f'<span class="ts">{_format_timestamp(t_start)}</span>'
             f'<span class="sp" style="color:{color}">{html.escape(sp)}</span>'
             f'<span class="tx">{html.escape(seg["text"])}</span>'
-            f'</div>'
+            f"</div>"
         )
     transcript_rows = "\n".join(rows)
 
@@ -326,7 +336,7 @@ def _render(
         .replace(">", "\\u003e")
         .replace("&", "\\u0026")
     )
-    duration_fmt  = _format_timestamp(duration_s)
+    duration_fmt = _format_timestamp(duration_s)
 
     return _HTML_TEMPLATE.format(
         title=html.escape(f"Встреча — {date_str}"),
@@ -396,12 +406,14 @@ summary{{cursor:pointer;user-select:none;font-size:.95rem;font-weight:600}}
 .sum-body hr{{border:none;border-top:1px solid #e2e8f0;margin:12px 0}}
 /* tables in summary */
 .md-table{{border-collapse:collapse;width:100%;font-size:.82rem;margin:10px 0}}
-.md-table th,.md-table td{{border:1px solid #e2e8f0;padding:5px 10px;text-align:left;vertical-align:top}}
+.md-table th,.md-table td{{border:1px solid #e2e8f0;padding:5px 10px;
+  text-align:left;vertical-align:top}}
 .md-table th{{background:#edf2f7;font-weight:700}}
 .md-table tr:nth-child(even) td{{background:#f7fafc}}
 /* highlights */
 .hl-body{{margin-top:12px;display:flex;flex-direction:column;gap:10px}}
-.hl-item{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 14px}}
+.hl-item{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;
+  padding:12px 14px}}
 .hl-header{{display:flex;align-items:center;gap:10px;margin-bottom:6px}}
 .hl-num{{min-width:22px;height:22px;background:#2563eb;color:#fff;border-radius:50%;
          font-size:.72rem;font-weight:700;display:flex;align-items:center;justify-content:center}}
@@ -415,7 +427,8 @@ summary{{cursor:pointer;user-select:none;font-size:.95rem;font-weight:600}}
 .controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}}
 .search{{flex:1;min-width:180px;padding:7px 12px;border:1px solid #cbd5e0;
          border-radius:8px;font-size:.9rem;background:#fff}}
-.search:focus{{outline:none;border-color:#4299e1;box-shadow:0 0 0 3px rgba(66,153,225,.2)}}
+.search:focus{{outline:none;border-color:#4299e1;
+  box-shadow:0 0 0 3px rgba(66,153,225,.2)}}
 /* speaker filter */
 .sp-filter{{display:flex;flex-wrap:wrap;gap:6px}}
 .sp-btn{{border:2px solid;border-radius:20px;padding:3px 12px;font-size:.78rem;

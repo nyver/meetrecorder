@@ -1,10 +1,11 @@
 """Тесты для transcriber.py — mock WhisperModel и pyannote."""
+
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pytest
 import soundfile as sf
@@ -12,22 +13,22 @@ import soundfile as sf
 from meeting_recorder.config import AppConfig
 from meeting_recorder.transcriber import (
     Segment,
-    _apply_speaker_names,
     _apply_diarization,
+    _get_transcribe_model,
+    _model_cache,
+    _patch_hf_use_auth_token,
+    _patch_speechbrain_lazy_module,
+    _patch_torch_load_compat,
+    _patch_torchaudio_compat,
     load_transcript,
     transcribe,
-    _get_transcribe_model,
-    _patch_torchaudio_compat,
-    _patch_hf_use_auth_token,
-    _patch_torch_load_compat,
-    _patch_speechbrain_lazy_module,
-    _model_cache,
+    unload_models,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 def clear_model_cache():
@@ -67,6 +68,7 @@ def _make_fake_info(language="ru", duration=10.0):
 # Segment
 # ---------------------------------------------------------------------------
 
+
 class TestSegment:
     def test_to_dict(self):
         s = Segment(start=1.5, end=2.5, speaker="SPEAKER_00", text="Hello")
@@ -81,30 +83,9 @@ class TestSegment:
 
 
 # ---------------------------------------------------------------------------
-# _apply_speaker_names
-# ---------------------------------------------------------------------------
-
-class TestApplySpeakerNames:
-    def test_basic_mapping(self):
-        segs = [
-            Segment(0, 1, "SPEAKER_00", "Hi"),
-            Segment(1, 2, "SPEAKER_01", "There"),
-            Segment(2, 3, "UNKNOWN", "?"),
-        ]
-        result = _apply_speaker_names(segs, {"SPEAKER_00": "Alice", "SPEAKER_01": "Bob"})
-        assert result[0].speaker == "Alice"
-        assert result[1].speaker == "Bob"
-        assert result[2].speaker == "UNKNOWN"  # нет в маппинге
-
-    def test_empty_names(self):
-        segs = [Segment(0, 1, "SPEAKER_00", "x")]
-        result = _apply_speaker_names(segs, {})
-        assert result[0].speaker == "SPEAKER_00"
-
-
-# ---------------------------------------------------------------------------
 # _apply_diarization
 # ---------------------------------------------------------------------------
+
 
 class TestApplyDiarization:
     def test_assigns_speakers(self, app_cfg):
@@ -153,6 +134,7 @@ class TestApplyDiarization:
 # load_transcript
 # ---------------------------------------------------------------------------
 
+
 class TestLoadTranscript:
     def test_load_valid(self, tmp_path):
         data = {"session_id": "abc", "segments": []}
@@ -176,6 +158,7 @@ class TestLoadTranscript:
 # ---------------------------------------------------------------------------
 # _get_transcribe_model (кэш)
 # ---------------------------------------------------------------------------
+
 
 class TestGetTranscribeModel:
     def test_model_cached(self):
@@ -203,6 +186,7 @@ class TestGetTranscribeModel:
 # transcribe (основная функция)
 # ---------------------------------------------------------------------------
 
+
 class TestTranscribe:
     def _mock_model(self, texts=("Hello",), language="ru", duration=5.0):
         model = MagicMock()
@@ -221,7 +205,9 @@ class TestTranscribe:
         app_cfg.transcription.device = "cpu"
 
         model = self._mock_model(["Hi there"])
-        with patch("meeting_recorder.transcriber._get_transcribe_model", return_value=model):
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
             result = transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
 
         assert result["language"] == "ru"
@@ -236,7 +222,9 @@ class TestTranscribe:
         app_cfg.transcription.diarization = False
 
         model = self._mock_model(["x"])
-        with patch("meeting_recorder.transcriber._get_transcribe_model", return_value=model) as mock_get:
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ) as mock_get:
             with patch("torch.cuda.is_available", return_value=False):
                 transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
         # При отсутствии GPU должен использоваться cpu
@@ -248,6 +236,7 @@ class TestTranscribe:
         app_cfg.transcription.diarization = True
         app_cfg.transcription.device = "cpu"
         from pydantic import SecretStr
+
         app_cfg.transcription.hf_token = SecretStr("fake-token")
 
         model = self._mock_model(["Hi", "There"])
@@ -258,8 +247,13 @@ class TestTranscribe:
         mock_diar.itertracks.return_value = [(turn, None, "spk_a")]
         mock_pipeline.return_value = mock_diar
 
-        with patch("meeting_recorder.transcriber._get_transcribe_model", return_value=model):
-            with patch("meeting_recorder.transcriber._get_diarization_model", return_value=mock_pipeline):
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
+            with patch(
+                "meeting_recorder.transcriber._get_diarization_model",
+                return_value=mock_pipeline,
+            ):
                 result = transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
 
         assert result["diarization_enabled"] is True
@@ -270,23 +264,56 @@ class TestTranscribe:
         app_cfg.transcription.device = "cpu"
 
         model = self._mock_model(["Hello"])
-        with patch("meeting_recorder.transcriber._get_transcribe_model", return_value=model):
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
             result = transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
 
         assert result["diarization_enabled"] is False
 
-    def test_speaker_names_applied(self, app_cfg, tmp_path):
+    def test_raw_speaker_labels_kept(self, app_cfg, tmp_path):
+        """Имена из speaker_names не зашиваются в транскрипт — применяются при показе."""
         audio = _make_wav(tmp_path / "audio.wav")
-        app_cfg.transcription.diarization = False
+        app_cfg.transcription.diarization = True
         app_cfg.transcription.device = "cpu"
         app_cfg.transcription.speaker_names = {"SPEAKER_00": "Alice"}
 
         model = self._mock_model(["Hi"])
-        # Подменяем _apply_speaker_names чтобы проверить вызов
-        with patch("meeting_recorder.transcriber._get_transcribe_model", return_value=model):
-            with patch("meeting_recorder.transcriber._apply_speaker_names", wraps=_apply_speaker_names) as mock_apply:
-                transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
-        mock_apply.assert_called_once()
+        diar = MagicMock()
+        turn = MagicMock(start=0.0, end=1.0)
+        diar.return_value.itertracks.return_value = [(turn, None, "SPK_A")]
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
+            with patch(
+                "meeting_recorder.transcriber._get_diarization_model", return_value=diar
+            ):
+                result = transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
+        assert result["segments"][0]["speaker"] == "SPEAKER_00"
+
+    def test_session_id_written(self, app_cfg, tmp_path):
+        audio = _make_wav(tmp_path / "audio.wav")
+        app_cfg.transcription.diarization = False
+        app_cfg.transcription.device = "cpu"
+        model = self._mock_model(["Hi"])
+        out = tmp_path / "t.json"
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
+            transcribe(audio, app_cfg, output_path=out, session_id="meeting_x")
+        assert json.loads(out.read_text(encoding="utf-8"))["session_id"] == "meeting_x"
+
+    def test_initial_prompt_none_for_non_ru(self, app_cfg, tmp_path):
+        audio = _make_wav(tmp_path / "audio.wav")
+        app_cfg.transcription.diarization = False
+        app_cfg.transcription.device = "cpu"
+        app_cfg.transcription.language = "en"
+        model = self._mock_model(["Hi"])
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
+            transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
+        assert model.transcribe.call_args.kwargs["initial_prompt"] is None
 
     def test_batched_pipeline_used_on_cuda(self, app_cfg, tmp_path):
         audio = _make_wav(tmp_path / "audio.wav")
@@ -301,10 +328,12 @@ class TestTranscribe:
         mock_batched_inst.transcribe.return_value = (iter(fake_segs), _make_fake_info())
         mock_batched.return_value = mock_batched_inst
 
-        with patch("meeting_recorder.transcriber._get_transcribe_model", return_value=model):
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
             with patch("torch.cuda.is_available", return_value=True):
                 with patch("faster_whisper.BatchedInferencePipeline", mock_batched):
-                    result = transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
+                    transcribe(audio, app_cfg, output_path=tmp_path / "t.json")
 
         mock_batched.assert_called_once_with(model=model)
 
@@ -315,8 +344,10 @@ class TestTranscribe:
         app_cfg.transcription.device = "cpu"
 
         model = self._mock_model()
-        with patch("meeting_recorder.transcriber._get_transcribe_model", return_value=model):
-            result = transcribe(audio, app_cfg)
+        with patch(
+            "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+        ):
+            transcribe(audio, app_cfg)
 
         expected = tmp_path / "audio_transcript.json"
         assert expected.exists()
@@ -325,6 +356,7 @@ class TestTranscribe:
 # ---------------------------------------------------------------------------
 # Monkey-patches (вызов не должен падать)
 # ---------------------------------------------------------------------------
+
 
 class TestCompatPatches:
     def test_patch_hf_auth_token_idempotent(self):
@@ -361,12 +393,31 @@ class TestCompatPatches:
         assert calls[1]["weights_only"] is False
 
     def test_patch_speechbrain_lazy_module_no_speechbrain(self):
-        with patch.dict("sys.modules", {"speechbrain": None, "speechbrain.utils": None,
-                                         "speechbrain.utils.importutils": None}):
+        with patch.dict(
+            "sys.modules",
+            {
+                "speechbrain": None,
+                "speechbrain.utils": None,
+                "speechbrain.utils.importutils": None,
+            },
+        ):
             _patch_speechbrain_lazy_module()  # не должна упасть при отсутствии модуля
 
     def test_patch_torchaudio_compat_idempotent(self):
         import torchaudio
+
         if not hasattr(torchaudio, "AudioMetaData"):
             _patch_torchaudio_compat()
         _patch_torchaudio_compat()  # повторный вызов — нет-оп
+
+
+class TestUnloadModels:
+    def test_clears_cache(self):
+        _model_cache["dummy"] = object()
+        unload_models()
+        assert "dummy" not in _model_cache
+
+    def test_noop_on_empty_cache(self):
+        _model_cache.clear()
+        unload_models()  # не должно падать
+        assert _model_cache == {}

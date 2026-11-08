@@ -1,15 +1,14 @@
-"""Обёртка над WhisperX: аудио → сегменты с диаризацией."""
+"""Транскрипция (faster-whisper) + диаризация (pyannote.audio): аудио → сегменты."""
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
-from .naming import SessionPaths
+from .session_utils import load_transcript_data, save_transcript_data
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +30,46 @@ def _get_transcribe_model(model_name: str, device: str, dtype: str | None = None
 
         from faster_whisper import WhisperModel
 
-        logger.info("Загрузка модели Whisper (model=%s, device=%s, dtype=%s)…", model_name, device, dtype)
+        logger.info(
+            "Загрузка модели Whisper (model=%s, device=%s, dtype=%s)…",
+            model_name,
+            device,
+            dtype,
+        )
         model = WhisperModel(
             model_name,
             device=device,
             compute_type=dtype or ("float16" if device == "cuda" else "int8"),
-            num_workers=4,
+            # транскрибируем в одном потоке — лишние воркеры только едят RAM
+            num_workers=1,
             download_root=Path.home() / ".cache" / "whisper",
         )
         logger.info("Модель Whisper загружена")
         _model_cache[key] = model
         return model
+
+
+def unload_models() -> None:
+    """Выгрузить закэшированные модели и освободить память GPU.
+
+    В долгоживущем процессе (трей) модели иначе держат несколько ГБ VRAM
+    между встречами. Повторная загрузка займёт время при следующей обработке.
+    """
+    with _model_cache_lock:
+        if not _model_cache:
+            return
+        _model_cache.clear()
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # torch может быть недоступен — не критично
+        pass
+    logger.info("Модели транскрипции выгружены из памяти")
 
 
 def _patch_torchaudio_compat() -> None:
@@ -51,10 +79,12 @@ def _patch_torchaudio_compat() -> None:
     Pyannote использует их как публичный API — патчим через soundfile.
     """
     import torchaudio
+
     if hasattr(torchaudio, "AudioMetaData"):
         return  # уже есть — ничего не делаем
 
     from collections import namedtuple
+
     import soundfile as sf
     import torch
 
@@ -75,11 +105,13 @@ def _patch_torchaudio_compat() -> None:
         )
 
     def _load(path, frame_offset=0, num_frames=-1, normalize=True, **kwargs):
-        import numpy as np
+
         start = frame_offset
         # soundfile использует -1 для «читать всё», None недопустим
         frames = -1 if (num_frames is None or num_frames < 0) else num_frames
-        data, sr = sf.read(str(path), start=start, frames=frames, dtype="float32", always_2d=True)
+        data, sr = sf.read(
+            str(path), start=start, frames=frames, dtype="float32", always_2d=True
+        )
         tensor = torch.from_numpy(data.T)
         return tensor, sr
 
@@ -92,10 +124,12 @@ def _patch_torchaudio_compat() -> None:
 
 
 def _patch_hf_use_auth_token() -> None:
-    """huggingface_hub 1.x убрал use_auth_token — патчим для совместимости с pyannote 3.x."""
+    """huggingface_hub 1.x убрал use_auth_token — патч для pyannote 3.x."""
     try:
         import inspect
+
         import huggingface_hub as hfh
+
         if "use_auth_token" in inspect.signature(hfh.hf_hub_download).parameters:
             return
 
@@ -109,6 +143,7 @@ def _patch_hf_use_auth_token() -> None:
         hfh.hf_hub_download = _patched
         try:
             import pyannote.audio.core.pipeline as _pa
+
             if hasattr(_pa, "hf_hub_download"):
                 _pa.hf_hub_download = _patched
         except ImportError:
@@ -118,14 +153,15 @@ def _patch_hf_use_auth_token() -> None:
 
 
 def _patch_torch_load_compat() -> None:
-    """PyTorch 2.6+ сменил weights_only=True по умолчанию — pyannote чекпоинты не грузятся.
+    """PyTorch 2.6+: weights_only=True по умолчанию — чекпоинты pyannote не грузятся.
 
-    Патчим torch.load глобально: устанавливаем weights_only=False только если вызывающий код
-    не передал weights_only явно.
+    Патчим torch.load глобально: weights_only=False ставится, только если
+    вызывающий код не передал weights_only явно.
     pl_load в pyannote — прямая ссылка, поэтому патчить cloud_io бесполезно.
 
-    БЕЗОПАСНОСТЬ: weights_only=False допускает выполнение произвольного кода при загрузке
-    недоверенных checkpoint-файлов. Допустимо только для моделей из доверенных источников
+    БЕЗОПАСНОСТЬ: weights_only=False допускает выполнение произвольного кода
+    при загрузке недоверенных checkpoint-файлов. Допустимо только для моделей
+    из доверенных источников
     (HuggingFace + официальные репозитории pyannote).
     """
     try:
@@ -147,9 +183,10 @@ def _patch_torch_load_compat() -> None:
 
 
 def _patch_speechbrain_lazy_module() -> None:
-    """speechbrain LazyModule.__getattr__ кидает ImportError для дандер-атрибутов (__file__ и др.)
+    """speechbrain LazyModule.__getattr__ кидает ImportError для dunder-атрибутов.
 
-    inspect.stack() → hasattr(module, '__file__') → ImportError (k2/flair/etc. не установлены).
+    inspect.stack() → hasattr(module, '__file__') → ImportError
+    (k2/flair/etc. не установлены).
     Патч: для дандер-атрибутов перехватываем ImportError и поднимаем AttributeError,
     чтобы hasattr() корректно вернул False.
     """
@@ -166,7 +203,7 @@ def _patch_speechbrain_lazy_module() -> None:
                 try:
                     return _orig_getattr(self, attr)
                 except (ImportError, Exception):
-                    raise AttributeError(attr)
+                    raise AttributeError(attr) from None
             return _orig_getattr(self, attr)
 
         LazyModule.__getattr__ = _safe_getattr
@@ -215,9 +252,12 @@ def _get_diarization_model(cfg: AppConfig):
             return None
         try:
             import torch
+
             pipeline.to(torch.device(cfg.transcription.device))
         except Exception as e:
-            logger.warning("Не удалось перенести pyannote на %s: %s", cfg.transcription.device, e)
+            logger.warning(
+                "Не удалось перенести pyannote на %s: %s", cfg.transcription.device, e
+            )
         _model_cache[key] = pipeline
         logger.info("pyannote.pipeline загружена")
         return pipeline
@@ -245,13 +285,19 @@ def transcribe(
     audio_path: Path | str,
     cfg: AppConfig,
     output_path: Path | None = None,
+    session_id: str = "",
 ) -> dict[str, Any]:
-    """Транскрибировать аудио через WhisperX с диаризацией.
+    """Транскрибировать аудио (faster-whisper) с диаризацией (pyannote).
+
+    Метки говорящих сохраняются «как есть» (SPEAKER_00, …): имена из
+    ``transcription.speaker_names`` применяются при отображении, поэтому
+    маппинг можно менять и перегенерировать отчёты без повторной транскрипции.
 
     Args:
         audio_path: Путь к WAV-файлу (микс или отдельная дорожка).
         cfg: Полная конфигурация приложения.
         output_path: Куда сохранить JSON (автоматически, если None).
+        session_id: Идентификатор сессии для записи в JSON.
 
     Returns:
         Словарь с ключами: session_id, language, duration_sec, segments.
@@ -268,10 +314,9 @@ def transcribe(
     if device == "cuda":
         try:
             import torch
+
             if not torch.cuda.is_available():
-                logger.warning(
-                    "cuda запрошен, но GPU не найден — переключение на cpu"
-                )
+                logger.warning("cuda запрошен, но GPU не найден — переключение на cpu")
                 device = "cpu"
         except ImportError:
             device = "cpu"
@@ -285,8 +330,14 @@ def transcribe(
     model = _get_transcribe_model(tcfg.model, device)
 
     logger.info(
-        "Начинаю транскрипцию: %s (model=%s, language=%s, device=%s, beam_size=%d, batch_size=%d)",
-        audio_path.name, tcfg.model, language, device, tcfg.beam_size, batch_size,
+        "Начинаю транскрипцию: %s (model=%s, language=%s, device=%s, "
+        "beam_size=%d, batch_size=%d)",
+        audio_path.name,
+        tcfg.model,
+        language,
+        device,
+        tcfg.beam_size,
+        batch_size,
     )
 
     transcribe_kwargs: dict = dict(
@@ -295,9 +346,7 @@ def transcribe(
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
         initial_prompt=(
-            "Это запись деловой встречи на русском языке."
-            if language == "ru"
-            else ""
+            "Это запись деловой встречи на русском языке." if language == "ru" else None
         ),
     )
 
@@ -305,6 +354,7 @@ def transcribe(
         # BatchedInferencePipeline: параллельная обработка чанков — 3-5x быстрее на GPU
         # без изменения качества (тот же алгоритм, тот же beam search)
         from faster_whisper import BatchedInferencePipeline
+
         pipeline = BatchedInferencePipeline(model=model)
         logger.info("Используется BatchedInferencePipeline (batch_size=%d)", batch_size)
         segments_raw, info = pipeline.transcribe(
@@ -318,12 +368,14 @@ def transcribe(
     # Собираем сегменты
     segments: list[Segment] = []
     for seg in segments_raw:
-        segments.append(Segment(
-            start=seg.start,
-            end=seg.end,
-            speaker="UNKNOWN",  # будет заполнено диаризацией
-            text=seg.text.strip(),
-        ))
+        segments.append(
+            Segment(
+                start=seg.start,
+                end=seg.end,
+                speaker="UNKNOWN",  # будет заполнено диаризацией
+                text=seg.text.strip(),
+            )
+        )
 
     logger.info("Whisper: %d сегментов (язык: %s)", len(segments), info.language)
 
@@ -335,20 +387,17 @@ def transcribe(
             segments = _apply_diarization(pipeline, audio_path, segments, cfg)
             diarization_applied = True
         else:
-            logger.warning("Диаризация пропущена — HF_TOKEN не задан или pyannote недоступна")
+            logger.warning(
+                "Диаризация пропущена — HF_TOKEN не задан или pyannote недоступна"
+            )
     else:
         logger.info("Диаризация отключена в конфиге")
-
-    # Сопоставление имён
-    speaker_names = tcfg.speaker_names
-    if speaker_names:
-        segments = _apply_speaker_names(segments, speaker_names)
 
     duration = info.duration if hasattr(info, "duration") else 0.0
     detected_lang = info.language if hasattr(info, "language") else language
 
     result = {
-        "session_id": "",  # будет заполнено вызывающим
+        "session_id": session_id,
         "language": detected_lang,
         "duration_sec": round(duration, 2),
         "diarization_enabled": diarization_applied,
@@ -361,10 +410,7 @@ def transcribe(
             audio_path.name.replace(".wav", "_transcript.json")
         )
     output_path = Path(output_path)
-    output_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    save_transcript_data(output_path, result)
     logger.info("Транскрипт сохранён: %s (%d сегментов)", output_path, len(segments))
 
     return result
@@ -411,21 +457,6 @@ def _apply_diarization(
     return segments
 
 
-def _apply_speaker_names(
-    segments: list[Segment],
-    speaker_names: dict[str, str],
-) -> list[Segment]:
-    """Заменить технические метки (SPEAKER_00) на имена из конфига."""
-    for seg in segments:
-        if seg.speaker in speaker_names:
-            seg.speaker = speaker_names[seg.speaker]
-    return segments
-
-
 def load_transcript(path: Path | str) -> dict[str, Any]:
     """Загрузить транскрипт из JSON-файла."""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Транскрипт не найден: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data
+    return load_transcript_data(Path(path))
