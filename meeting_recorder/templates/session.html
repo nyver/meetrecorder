@@ -27,6 +27,7 @@
 }
 .hl-ts:hover { background: #dbeafe; }
 .hl-desc { font-size: .85rem; color: #475569; line-height: 1.55; margin: 0; }
+mark.hit { background: #fef08a; border-radius: 2px; }
 {% endblock %}
 
 {% block header_extra %}
@@ -140,7 +141,7 @@
     <input id="transcript-search"
            type="search"
            placeholder="Поиск в транскрипте…"
-           oninput="filterTranscript(this.value)"
+           oninput="onSearchInput(this.value)"
            style="flex:1;padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;
                   font-size:.85rem;outline:none;background:#f8fafc;color:#0f172a">
     <span id="search-count" style="font-size:.8rem;color:#94a3b8;white-space:nowrap"></span>
@@ -175,28 +176,54 @@
 
 {# ---- JavaScript ---- #}
 <script>
+// Подсветка совпадений строится из DOM-узлов (textNode + <mark>), а не через
+// innerHTML: текст транскрипта никогда не интерпретируется как HTML.
+function highlightText(el, raw, q) {
+  el.textContent = '';
+  if (!q) { el.textContent = raw; return; }
+  var lower = raw.toLowerCase();
+  var pos = 0;
+  var idx = lower.indexOf(q);
+  while (idx !== -1) {
+    if (idx > pos) el.appendChild(document.createTextNode(raw.slice(pos, idx)));
+    var mark = document.createElement('mark');
+    mark.className = 'hit';
+    mark.textContent = raw.slice(idx, idx + q.length);
+    el.appendChild(mark);
+    pos = idx + q.length;
+    idx = lower.indexOf(q, pos);
+  }
+  if (pos < raw.length) el.appendChild(document.createTextNode(raw.slice(pos)));
+}
+
+var _segs = null;          // кэш: [{el, tx, raw, txt, spk, marked}]
+function segIndex() {
+  if (_segs) return _segs;
+  _segs = Array.prototype.map.call(document.querySelectorAll('#tlist .seg'), function (el) {
+    var tx = el.querySelector('.tx');
+    return {
+      el: el, tx: tx, raw: tx ? tx.textContent : '',
+      txt: el.getAttribute('data-text') || '',
+      spk: el.getAttribute('data-speaker') || '',
+      marked: false
+    };
+  });
+  return _segs;
+}
+
 function filterTranscript(query) {
   var q = query.trim().toLowerCase();
-  var segs = document.querySelectorAll('#tlist .seg');
+  var segs = segIndex();
   var matched = 0;
 
-  segs.forEach(function (el) {
-    var txt = el.getAttribute('data-text') || '';
-    var spk = el.getAttribute('data-speaker') || '';
-    var hit = !q || txt.indexOf(q) !== -1 || spk.indexOf(q) !== -1;
-    el.style.display = hit ? '' : 'none';
-
-    var txEl = el.querySelector('.tx');
-    if (txEl) {
-      if (!q || txt.indexOf(q) === -1) {
-        txEl.innerHTML = txEl.textContent;
-      } else {
-        var raw = txEl.textContent;
-        var re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
-        txEl.innerHTML = raw.replace(re, '<mark style="background:#fef08a;border-radius:2px">$1</mark>');
-      }
+  segs.forEach(function (s) {
+    var inText = !!q && s.txt.indexOf(q) !== -1;
+    var hit = !q || inText || s.spk.indexOf(q) !== -1;
+    s.el.style.display = hit ? '' : 'none';
+    if (s.tx && (inText || s.marked)) {   // перерисовываем только изменившиеся
+      highlightText(s.tx, s.raw, inText ? q : '');
+      s.marked = inText;
     }
-
     if (hit) matched++;
   });
 
@@ -204,6 +231,12 @@ function filterTranscript(query) {
   if (countEl) {
     countEl.textContent = q ? matched + ' / ' + segs.length : '';
   }
+}
+
+var _searchTimer = null;
+function onSearchInput(value) {          // debounce: не фильтруем на каждый символ
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(function () { filterTranscript(value); }, 150);
 }
 
 function switchTab(id, btn) {
@@ -230,13 +263,27 @@ function seek(t) {
 (function () {
   var player = document.getElementById('player');
   if (!player) return;
+  var segs = segIndex();
+  var starts = segs.map(function (s) { return parseFloat(s.el.dataset.start); });
+  var ends = segs.map(function (s) { return parseFloat(s.el.dataset.end); });
+  var current = -1;
+
+  // Бинарный поиск последнего сегмента с start <= t (сегменты упорядочены)
+  function locate(t) {
+    var lo = 0, hi = starts.length - 1, ans = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (starts[mid] <= t) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return ans !== -1 && t < ends[ans] ? ans : -1;
+  }
 
   player.addEventListener('timeupdate', function () {
-    var t = player.currentTime;
-    document.querySelectorAll('.seg').forEach(function (el) {
-      var on = t >= parseFloat(el.dataset.start) && t < parseFloat(el.dataset.end);
-      el.classList.toggle('active', on);
-    });
+    var idx = locate(player.currentTime);
+    if (idx === current) return;          // DOM трогаем только при смене сегмента
+    if (current !== -1) segs[current].el.classList.remove('active');
+    if (idx !== -1) segs[idx].el.classList.add('active');
+    current = idx;
   });
 }());
 {% endif %}

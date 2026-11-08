@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -36,6 +37,22 @@ class LLMTruncatedError(LLMClientError):
     def __init__(self, message: str, partial: str = ""):
         super().__init__(message)
         self.partial = partial
+
+
+class LLMContextOverflowError(LLMClientError):
+    """Промпт не помещается в контекстное окно модели (HTTP 400/413).
+
+    Повтор того же запроса бессмыслен — вызывающий код должен уменьшить вход
+    (например, разбить транскрипт на более мелкие части).
+    """
+
+
+# Тексты ошибок переполнения контекста: llama-server, OpenAI, OpenRouter, vLLM
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"context[ _](length|size|window)|maximum context|exceeds? the (available )?"
+    r"context|exceed_context_size|too many tokens|prompt is too long",
+    re.IGNORECASE,
+)
 
 
 class _RetryableError(Exception):
@@ -165,8 +182,18 @@ class LLMClient:
                     "Убедитесь, что сервер запущен."
                 )
             ) from e
+        except (httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            raise _RetryableError(
+                LLMClientError(f"Таймаут подключения к LLM: {e}")
+            ) from e
         except httpx.TimeoutException as e:
-            raise _RetryableError(LLMClientError(f"Таймаут запроса к LLM: {e}")) from e
+            # ReadTimeout/WriteTimeout не повторяем: генерация длиннее
+            # llm.timeout повторится так же, а локальный сервер получит тот
+            # же тяжёлый запрос повторно.
+            raise LLMClientError(
+                f"Таймаут ответа LLM ({self.config.timeout:.0f} с): {e}. "
+                "Увеличьте llm.timeout или уменьшите llm.max_tokens."
+            ) from e
         except httpx.HTTPError as e:
             # ReadError, RemoteProtocolError и прочие транспортные сбои
             raise _RetryableError(LLMClientError(f"Сетевая ошибка LLM: {e}")) from e
@@ -187,6 +214,10 @@ class LLMClient:
         if status in (401, 403):
             return LLMClientError(
                 f"Ошибка авторизации: {status}. Проверьте api_key и backend настройки."
+            )
+        if status in (400, 413) and _CONTEXT_OVERFLOW_RE.search(body):
+            return LLMContextOverflowError(
+                f"Запрос не помещается в контекст модели (HTTP {status}): {body}"
             )
         error = LLMClientError(f"HTTP ошибка {status}: {body}")
         if status in _RETRYABLE_STATUSES:

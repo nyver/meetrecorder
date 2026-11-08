@@ -25,12 +25,13 @@ pip install -e ".[tray,web]"
 ffmpeg -version
 ```
 
-> Audio resampling (if sample rates differ): `pip install -e ".[audio]"`
+> Audio with different sample rates (mic vs system) is resampled by ffmpeg —
+> no extra Python packages are needed.
 
 ## Configuration
 
 ```bash
-# Generate a config template
+# Generate a config template (an existing file is never overwritten without --force)
 mrec generate-config
 ```
 
@@ -77,14 +78,19 @@ llm:
   model: "my-model-alias"
   context_tokens: 32768         # model context window (input + output), tokens
   max_tokens: 16384             # increase for thinking models (DeepSeek-R1 etc.)
-  max_retries: 2                # retries on 429 / 5xx / network errors
-  timeout: 600
+  max_retries: 2                # retries on 429 / 5xx / connection errors
+  timeout: 600                  # per-request response timeout (not retried)
 ```
 
 `context_tokens` must match the real context of the model (e.g. `--ctx-size` of
 llama-server). Long meetings are split into parts that fit the window: summary and
 highlights use map-reduce, protocol cleaning goes part by part, chat trims the
-transcript and the dialogue history.
+transcript and the dialogue history. Token counts are estimated conservatively
+(2.5 characters per token); if the server still reports a context overflow, the
+request is repeated automatically with 2× and then 4× smaller parts.
+
+A response timeout (`llm.timeout`) is **not** retried — a generation that did not
+fit the timeout would only hit it again; increase `timeout` or decrease `max_tokens`.
 
 ### HuggingFace token (diarization)
 
@@ -129,6 +135,15 @@ Tray menu:
 
 Menu actions are ignored while another operation is running (no double start).
 
+Only one recording can run at a time across the tray and the CLI: both take the
+same lock file. `mrec start` refuses to start while the tray is recording, and
+`mrec stop` asks to stop a tray recording from the tray menu.
+
+**Exit** while recording stops the recording and mixes the audio in the background
+(the menu stays responsive), then closes the tray. Transcription and reports are
+not started on exit — process the session later with `mrec process <session_id>`
+or the tray menu.
+
 #### Recording devices submenu
 
 - **🎙️ Microphone** — "Auto-detect" or any dshow capture device.
@@ -137,7 +152,7 @@ Menu actions are ignored while another operation is running (no double start).
   `dshow`: the capture device (virtual-audio-capturer, Stereo Mix…); not available
   for `wasapi`.
 - **🔄 Refresh device list** — rescan immediately. The list is also rescanned every
-  10 s while idle; the menu is rebuilt only when devices actually change.
+  30 s while idle; the menu is rebuilt only when devices actually change.
 
 The selection is written only to the corresponding key of the config file that the
 tray was started with (`mrec -c …  tray`); other keys and secrets stay untouched.
@@ -195,8 +210,8 @@ mrec serve
 # Launch system tray mode
 mrec tray
 
-# Generate a config template
-mrec generate-config
+# Generate a config template (use --force to overwrite an existing file)
+mrec generate-config -o config.yaml
 ```
 
 All commands that accept `session_id` default to the last eligible session when omitted.
@@ -206,11 +221,15 @@ All commands that accept `session_id` default to the last eligible session when 
 ```bash
 mrec serve                          # opens http://127.0.0.1:7070
 mrec serve --port 8080 --no-open    # custom port, no auto-open
+mrec serve --host 0.0.0.0           # network access, protected by a token
 ```
 
-The dashboard has no authentication. By default it listens on `127.0.0.1` and accepts
-only local `Host` headers (DNS-rebinding protection); `--host 0.0.0.0` exposes all
-meetings to the network.
+By default the dashboard listens on `127.0.0.1` and accepts only local `Host`
+headers (DNS-rebinding protection). With a non-local `--host` it requires an access
+token: a random one is generated at start (or pass `--token …`) and printed as a
+link `http://host:port/?token=…`. The first request with the token sets an HttpOnly
+cookie and redirects to a URL without it. Traffic is plain HTTP — share the link
+only with trusted people on a trusted network.
 
 The dashboard provides a browser UI for browsing and replaying meetings:
 
@@ -297,6 +316,7 @@ meeting_recorder/
 ├── dashboard.py    # FastAPI web dashboard (session list + detail view)
 ├── pipeline.py     # Pipeline orchestration (finalize_recording, process_session, run_*)
 ├── session_utils.py # Shared artifact helpers (atomic writes, transcript, highlights)
+├── state.py        # Recording state + inter-process recording lock (CLI and tray)
 ├── tray.py         # System tray icon (pystray + Pillow)
 ├── templates/      # Jinja2 HTML templates for the web dashboard
 └── prompts/        # LLM prompt templates (summary, highlights, protocol_clean)
@@ -306,8 +326,9 @@ meeting_recorder/
 
 ```
 Recording (ffmpeg + soundcard)
-  → finalize_recording: mix_audio_files (end-aligned, averaged)
-  → Transcription (faster-whisper + pyannote diarization)
+  → finalize_recording: mix_audio_files (end-aligned, averaged, streamed in blocks)
+  → Transcription (faster-whisper + pyannote diarization; audio decoded once,
+    batch size halved automatically on CUDA out-of-memory)
   → Protocol (Markdown, verbatim with timestamps)
   → Summary (LLM, map-reduce for long meetings)
   → Highlights (LLM, 5 key moments; map-reduce for long meetings)
@@ -341,9 +362,19 @@ llama-server -m your-model.gguf --host 127.0.0.1 --port 8080 --ctx-size 32768
 
 - Log: `%APPDATA%\MeetingRecorder\logs\meeting_recorder.log` (rotated, 5 MB × 3);
   override with `MEETING_RECORDER_LOG_FILE`.
-- Recording state (`mrec start` / `mrec stop`): `%APPDATA%\MeetingRecorder\.state`;
-  override with `MEETING_RECORDER_STATE_DIR`. A running `mrec start` holds a lock
-  file, so a state left after a crash is detected and cleaned up automatically.
+- Recording state (`mrec start` / `mrec stop` / tray): `%APPDATA%\MeetingRecorder\.state`;
+  override with `MEETING_RECORDER_STATE_DIR`. The recording process (`mrec start` or
+  the tray) holds a lock file, so a state left after a crash is detected and cleaned
+  up automatically.
+
+## Resource usage
+
+- Audio mixing and resampling are streamed — memory does not grow with meeting
+  length (previously ~2.5–3 GB per hour of recording).
+- The mix is decoded once to 16 kHz mono and shared by Whisper and pyannote.
+- `*_mix.wav` and `*_final.mp4` are written to temporary files and renamed only on
+  success, so an interrupted mix/mux never leaves a broken artifact behind.
+- The dashboard caches per-session transcript metadata (by file mtime/size).
 
 ## Development
 

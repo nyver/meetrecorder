@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import enum
 import logging
-import shutil
 import subprocess
 import sys
 import threading
@@ -15,6 +14,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from . import state as _state
 from .config import AppConfig, resolve_config_path, update_config_file
 from .naming import SessionPaths, create_session, list_sessions
 from .recorder import (
@@ -64,8 +64,10 @@ _ERROR_DISPLAY_SECS = 4  # обычная ошибка
 _ERROR_LONG_SECS = 6  # ошибка с длинным описанием (обработка)
 _ERROR_BRIEF_SECS = 3  # кратковременная ошибка ("нет сессий" и т.п.)
 _TICK_SECS = 1.0  # период тикера (мигание иконки, таймер в подсказке)
-_DEVICE_REFRESH_SECS = 10  # период опроса списка устройств в idle
-_EXIT_PROCESS_TIMEOUT = 1800  # до 30 мин: остановка + транскрипция + отчёт при выходе
+# Период опроса списка устройств в idle: каждый опрос запускает ffmpeg
+# (-list_devices), поэтому не чаще раза в 30 с; есть ручное «Обновить».
+_DEVICE_REFRESH_SECS = 30
+_STARTING_WAIT_SECS = 30  # при выходе: ожидание завершения старта записи
 _MAX_SESSIONS_IN_MENU = 25
 
 
@@ -127,11 +129,14 @@ class TrayApp:
         self._lock = threading.Lock()
         self._recorder: MeetingRecorder | None = None
         self._paths: SessionPaths | None = None
+        self._rec_lock = None  # дескриптор lock-файла записи (meeting_recorder.state)
         self._icon = None  # pystray.Icon
         self._op_start: float = 0.0  # время начала текущей операции
         self._devices = _DeviceSnapshot()
         self._devices_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._start_finished = threading.Event()  # нет незавершённого старта
+        self._start_finished.set()
 
     # ------------------------------------------------------------------
     # Управление состоянием
@@ -334,20 +339,52 @@ class TrayApp:
 
     def _on_start(self, icon, item) -> None:
         if self._try_begin(State.STARTING):
+            # Колбэки меню выполняются в одном UI-потоке: _on_exit не может
+            # вклиниться между _try_begin и clear().
+            self._start_finished.clear()
             self._spawn(self._do_start, "tray-start")
 
     def _do_start(self) -> None:
         try:
+            self._do_start_inner()
+        finally:
+            self._start_finished.set()
+
+    def _do_start_inner(self) -> None:
+        # Тот же lock, что и у `mrec start`: одновременно пишет только один процесс
+        rec_lock = _state.acquire_recording_lock()
+        if rec_lock is None:
+            self._flash(
+                State.ERROR, "Запись уже идёт (mrec start)", _ERROR_DISPLAY_SECS
+            )
+            return
+        try:
             paths = create_session(self.cfg.output_dir)
             recorder = MeetingRecorder(self.cfg, paths)
             recorder.start()
+            _state.save_state(
+                paths.session_id,
+                str(paths.video),
+                recorder.ffmpeg_pid,
+                owner=_state.OWNER_TRAY,
+            )
             with self._lock:
                 self._recorder = recorder
                 self._paths = paths
+                self._rec_lock = rec_lock
             self._set_state(State.RECORDING, f"Запись: {paths.session_id}")
         except Exception as exc:
+            _state.release_recording_lock(rec_lock)
             logger.error("Ошибка старта записи: %s", exc)
             self._flash(State.ERROR, str(exc)[:60], _ERROR_DISPLAY_SECS)
+
+    def _release_recording(self) -> None:
+        """Снять lock записи и state-файл (после остановки ffmpeg)."""
+        with self._lock:
+            rec_lock, self._rec_lock = self._rec_lock, None
+        if rec_lock is not None:
+            _state.remove_state()
+            _state.release_recording_lock(rec_lock)
 
     def _on_stop(self, icon, item) -> None:
         if self.state == State.RECORDING:
@@ -374,6 +411,8 @@ class TrayApp:
             recorder.stop()
         except Exception as exc:
             logger.error("Ошибка остановки ffmpeg: %s", exc)
+        finally:
+            self._release_recording()
 
         self._set_state(State.PROCESSING, "Свожу аудио…")
         try:
@@ -390,10 +429,6 @@ class TrayApp:
         paths = self._do_stop_and_mix()
         if paths is not None:
             self._do_process(paths)
-
-    def _do_stop_blocking(self) -> None:
-        """Остановить запись и дождаться полной обработки (для _on_exit)."""
-        self._do_stop()
 
     def _do_stop_only(self) -> None:
         paths = self._do_stop_and_mix()
@@ -451,14 +486,15 @@ class TrayApp:
             chat_args[1:1] = ["-c", str(self._config_path)]
         try:
             if sys.platform == "win32":
-                wt = shutil.which("wt")
-                if wt:
-                    subprocess.Popen([wt, "cmd", "/k", *chat_args])
-                else:
-                    subprocess.Popen(
-                        ["cmd", "/k", *chat_args],
-                        creationflags=subprocess.CREATE_NEW_CONSOLE,
-                    )
+                # cmd /s /k "<строка>": с /s cmd снимает ровно одну внешнюю пару
+                # кавычек, поэтому пути с пробелами внутри list2cmdline не ломаются.
+                # wt не используем: он трактует «;» в аргументах как разделитель
+                # команд. Терминал по умолчанию Windows 11 всё равно откроет окно
+                # в Windows Terminal.
+                subprocess.Popen(
+                    f'cmd /s /k "{subprocess.list2cmdline(chat_args)}"',
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
             else:
                 subprocess.Popen(["x-terminal-emulator", "-e", *chat_args])
         except Exception as exc:
@@ -973,15 +1009,46 @@ class TrayApp:
         self._open_in_explorer(folder)
 
     def _on_exit(self, icon, item) -> None:
-        if self.state == State.RECORDING:
-            # Не-daemon тред: дожидаемся остановки записи И полной обработки до выхода.
-            t = threading.Thread(
-                target=self._do_stop_blocking, daemon=False, name="tray-exit-stop"
-            )
-            t.start()
-            t.join(timeout=_EXIT_PROCESS_TIMEOUT)
+        """Выход. Вызывается в UI-потоке pystray — его нельзя блокировать.
+
+        Если идёт (или запускается) запись, она останавливается и сводится в
+        фоновом не-daemon потоке, после чего приложение закрывается. Долгая
+        обработка (транскрипция, LLM) при выходе не запускается — сессию
+        можно обработать позже (`mrec process` или пункт меню трея).
+        """
+        if self.state in (State.RECORDING, State.STARTING):
+            self._set_state(State.PROCESSING, "Сохраняю запись перед выходом…")
+            threading.Thread(
+                target=self._stop_then_exit, daemon=False, name="tray-exit-stop"
+            ).start()
+            return
+        self._shutdown(icon)
+
+    def _stop_then_exit(self) -> None:
+        try:
+            # Старт записи ещё идёт (поток tray-start) — дожидаемся его,
+            # иначе ffmpeg останется работать после выхода.
+            self._start_finished.wait(_STARTING_WAIT_SECS)
+            paths = self._do_stop_and_mix()
+            if paths is not None:
+                logger.info(
+                    "Запись сохранена при выходе; обработка: mrec process %s",
+                    paths.session_id,
+                )
+                self._notify(
+                    "Meeting Recorder",
+                    f"Запись сохранена. Обработать: mrec process {paths.session_id}",
+                )
+        except Exception as exc:
+            logger.error("Ошибка остановки записи при выходе: %s", exc)
+        finally:
+            self._shutdown()
+
+    def _shutdown(self, icon=None) -> None:
         self._stop_event.set()
-        icon.stop()
+        icon = icon or self._icon
+        if icon is not None:
+            icon.stop()
 
     # ------------------------------------------------------------------
     # Системное уведомление Windows

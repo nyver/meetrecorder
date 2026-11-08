@@ -383,3 +383,67 @@ class TestResponseParsing:
         client = _client(mock_http)
         assert client.chat([{"role": "user", "content": "x"}], stream=True) == "Hi"
         assert mock_http.stream.call_args.kwargs["json"]["stream"] is True
+
+
+# ---------------------------------------------------------------------------
+# Таймауты и переполнение контекста
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutsAndOverflow:
+    def _client(self, mock_http: MagicMock, **kw) -> LLMClient:
+        with patch("meeting_recorder.llm_client.httpx.Client") as mock_cls:
+            mock_cls.return_value = mock_http
+            return LLMClient(_cfg(**kw))
+
+    def test_read_timeout_not_retried(self):
+        mock_http = MagicMock()
+        mock_http.post.side_effect = httpx.ReadTimeout("slow")
+        client = self._client(mock_http, max_retries=3)
+        with pytest.raises(LLMClientError, match="Таймаут ответа"):
+            client.chat([{"role": "user", "content": "x"}])
+        assert mock_http.post.call_count == 1
+
+    def test_connect_timeout_retried(self):
+        mock_http = MagicMock()
+        ok = MagicMock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+        }
+        mock_http.post.side_effect = [httpx.ConnectTimeout("no route"), ok]
+        client = self._client(mock_http, max_retries=2)
+        assert client.chat([{"role": "user", "content": "x"}]) == "hi"
+        assert mock_http.post.call_count == 2
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"error":{"message":"the request exceeds the available context size"}}',
+            "This model's maximum context length is 32768 tokens",
+            '{"error":{"code":"context_length_exceeded"}}',
+        ],
+    )
+    def test_context_overflow_detected(self, body):
+        from meeting_recorder.llm_client import LLMContextOverflowError
+
+        request = httpx.Request("POST", "http://x/v1/chat/completions")
+        response = httpx.Response(400, text=body, request=request)
+        mock_http = MagicMock()
+        mock_http.post.return_value = response
+        client = self._client(mock_http, max_retries=2)
+        with pytest.raises(LLMContextOverflowError):
+            client.chat([{"role": "user", "content": "x"}])
+        assert mock_http.post.call_count == 1  # не повторяется
+
+    def test_plain_400_is_not_overflow(self):
+        from meeting_recorder.llm_client import LLMContextOverflowError
+
+        request = httpx.Request("POST", "http://x/v1/chat/completions")
+        response = httpx.Response(400, text="invalid temperature", request=request)
+        mock_http = MagicMock()
+        mock_http.post.return_value = response
+        client = self._client(mock_http)
+        with pytest.raises(LLMClientError) as exc_info:
+            client.chat([{"role": "user", "content": "x"}])
+        assert not isinstance(exc_info.value, LLMContextOverflowError)

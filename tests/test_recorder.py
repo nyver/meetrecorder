@@ -173,6 +173,71 @@ class TestMixAudioFiles:
         with pytest.raises(ValueError, match="пустой"):
             mix_audio_files(mic, sys_, tmp_path / "mix.wav")
 
+    def test_streaming_blocks_match_full_mix(self, tmp_path):
+        """Блочное сведение даёт тот же результат, что и сведение целиком."""
+        rng = np.random.default_rng(0)
+        a = (rng.standard_normal(10_000) * 0.1).astype(np.float32)
+        b = (rng.standard_normal(12_345) * 0.1).astype(np.float32)
+        sf.write(str(tmp_path / "mic.wav"), a, 48000, subtype="PCM_16")
+        sf.write(str(tmp_path / "sys.wav"), b, 48000, subtype="PCM_16")
+        out = tmp_path / "mix.wav"
+        with patch("meeting_recorder.recorder._MIX_BLOCK_FRAMES", 1000):
+            mix_audio_files(tmp_path / "mic.wav", tmp_path / "sys.wav", out)
+        mixed, _ = sf.read(str(out), dtype="float32")
+        a16, _ = sf.read(str(tmp_path / "mic.wav"), dtype="float32")
+        b16, _ = sf.read(str(tmp_path / "sys.wav"), dtype="float32")
+        expected = (a16 + b16[len(b16) - len(a16) :]) / 2
+        assert len(mixed) == len(a16)
+        assert np.allclose(mixed, expected, atol=2e-4)
+        assert not list(tmp_path.glob(".*part*"))
+
+    def test_stereo_input_uses_first_channel(self, tmp_path):
+        stereo = np.zeros((4800, 2), dtype=np.float32)
+        stereo[:, 0] = 0.5
+        stereo[:, 1] = -0.5
+        sf.write(str(tmp_path / "mic.wav"), stereo, 48000)
+        _make_wav(tmp_path / "sys.wav", 0.1)
+        out = tmp_path / "mix.wav"
+        mix_audio_files(tmp_path / "mic.wav", tmp_path / "sys.wav", out)
+        info = sf.info(str(out))
+        assert info.channels == 1
+
+    def test_sample_rate_mismatch_resamples_via_ffmpeg(self, tmp_path):
+        mic = tmp_path / "mic.wav"
+        sys_ = tmp_path / "sys.wav"
+        sf.write(str(mic), np.zeros(4800, dtype=np.float32), 48000)
+        sf.write(str(sys_), np.zeros(4410, dtype=np.float32), 44100)
+
+        def fake_resample(src, sr):
+            dst = tmp_path / ".sys.48000hz.wav"
+            sf.write(str(dst), np.zeros(4800, dtype=np.float32), sr)
+            return dst
+
+        with patch(
+            "meeting_recorder.recorder._resample_with_ffmpeg", side_effect=fake_resample
+        ) as m:
+            mix_audio_files(mic, sys_, tmp_path / "mix.wav")
+        m.assert_called_once_with(sys_, 48000)
+        assert sf.info(str(tmp_path / "mix.wav")).samplerate == 48000
+        assert not (tmp_path / ".sys.48000hz.wav").exists()  # временный файл удалён
+
+    def test_resample_with_ffmpeg_failure(self, tmp_path):
+        from meeting_recorder.recorder import _resample_with_ffmpeg
+
+        with patch("meeting_recorder.recorder.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=1, stderr="bad")
+            with pytest.raises(RuntimeError, match="пересэмплировать"):
+                _resample_with_ffmpeg(tmp_path / "s.wav", 48000)
+
+    def test_resample_with_ffmpeg_success(self, tmp_path):
+        from meeting_recorder.recorder import _resample_with_ffmpeg
+
+        with patch(
+            "meeting_recorder.recorder.subprocess.run", side_effect=_fake_ffmpeg_ok
+        ):
+            dst = _resample_with_ffmpeg(tmp_path / "s.wav", 48000)
+        assert dst.exists()
+
 
 # ---------------------------------------------------------------------------
 # MeetingRecorder
@@ -305,6 +370,12 @@ class TestMeetingRecorderStop:
 # ---------------------------------------------------------------------------
 
 
+def _fake_ffmpeg_ok(cmd, **kwargs):
+    """Имитация успешного ffmpeg: создаёт выходной файл (последний аргумент)."""
+    Path(cmd[-1]).write_bytes(b"data")
+    return MagicMock(returncode=0, stderr="")
+
+
 class TestMuxVideo:
     def test_mux_success(self, tmp_path):
         video = tmp_path / "v.mp4"
@@ -313,28 +384,55 @@ class TestMuxVideo:
         video.write_bytes(b"")
         audio.write_bytes(b"")
 
-        with patch("meeting_recorder.recorder.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "meeting_recorder.recorder.subprocess.run", side_effect=_fake_ffmpeg_ok
+        ) as mock_run:
             result = mux_video(video, audio, out)
-            assert result == out
+        assert result == out
+        assert out.read_bytes() == b"data"
+        # ffmpeg пишет во временный файл, а не сразу в итоговый
+        assert mock_run.call_args.args[0][-1] != str(out)
+        assert not list(tmp_path.glob("*.part*"))
 
-    def test_mux_failure_raises(self, tmp_path):
+    def test_mux_failure_raises_and_leaves_no_files(self, tmp_path):
         video = tmp_path / "v.mp4"
         audio = tmp_path / "a.wav"
         out = tmp_path / "final.mp4"
 
-        with patch("meeting_recorder.recorder.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stderr="error details")
+        def fail(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"partial")
+            return MagicMock(returncode=1, stderr="error details")
+
+        with patch("meeting_recorder.recorder.subprocess.run", side_effect=fail):
             with pytest.raises(RuntimeError, match="ffmpeg завершился"):
                 mux_video(video, audio, out)
+        assert not out.exists()
+        assert not list(tmp_path.glob("*.part*"))
 
-    def test_mux_uses_utf8_and_no_window(self, tmp_path):
-        with patch("meeting_recorder.recorder.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+    def test_mux_timeout_leaves_no_files(self, tmp_path):
+        import subprocess
+
+        out = tmp_path / "final.mp4"
+
+        def hang(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"partial")
+            raise subprocess.TimeoutExpired(cmd, 1)
+
+        with patch("meeting_recorder.recorder.subprocess.run", side_effect=hang):
+            with pytest.raises(subprocess.TimeoutExpired):
+                mux_video(tmp_path / "v.mp4", tmp_path / "a.wav", out)
+        assert not out.exists()
+        assert not list(tmp_path.glob("*.part*"))
+
+    def test_mux_uses_utf8_quiet_and_no_window(self, tmp_path):
+        with patch(
+            "meeting_recorder.recorder.subprocess.run", side_effect=_fake_ffmpeg_ok
+        ) as mock_run:
             mux_video(tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4")
         kwargs = mock_run.call_args.kwargs
         assert kwargs["encoding"] == "utf-8"
         assert kwargs["errors"] == "replace"
+        assert "-nostats" in mock_run.call_args.args[0]
 
 
 # ---------------------------------------------------------------------------

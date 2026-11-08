@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import logging
 import threading
 from pathlib import Path
@@ -15,6 +17,10 @@ logger = logging.getLogger(__name__)
 # Кэш для моделей (singleton) + lock для thread-safety
 _model_cache: dict[str, Any] = {}
 _model_cache_lock = threading.Lock()
+
+_SAMPLE_RATE = 16000  # частота, на которой работают Whisper и pyannote
+# Последовательность batch_size при нехватке видеопамяти (0 — без батчинга)
+_OOM_MIN_BATCH = 4
 
 
 def _get_transcribe_model(model_name: str, device: str, dtype: str | None = None):
@@ -59,8 +65,11 @@ def unload_models() -> None:
         if not _model_cache:
             return
         _model_cache.clear()
-    import gc
+    _free_gpu_memory()
+    logger.info("Модели транскрипции выгружены из памяти")
 
+
+def _free_gpu_memory() -> None:
     gc.collect()
     try:
         import torch
@@ -69,7 +78,6 @@ def unload_models() -> None:
             torch.cuda.empty_cache()
     except Exception:  # torch может быть недоступен — не критично
         pass
-    logger.info("Модели транскрипции выгружены из памяти")
 
 
 def _patch_torchaudio_compat() -> None:
@@ -152,34 +160,41 @@ def _patch_hf_use_auth_token() -> None:
         logger.debug("Патч hf_hub не применён: %s", e)
 
 
-def _patch_torch_load_compat() -> None:
+_torch_load_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _trusted_torch_load():
     """PyTorch 2.6+: weights_only=True по умолчанию — чекпоинты pyannote не грузятся.
 
-    Патчим torch.load глобально: weights_only=False ставится, только если
-    вызывающий код не передал weights_only явно.
-    pl_load в pyannote — прямая ссылка, поэтому патчить cloud_io бесполезно.
+    На время блока torch.load получает weights_only=False (если вызывающий код
+    не передал weights_only явно), после выхода исходная функция
+    восстанавливается. pl_load в pyannote вызывает torch.load по атрибуту
+    модуля, поэтому патчится именно torch.load.
 
     БЕЗОПАСНОСТЬ: weights_only=False допускает выполнение произвольного кода
-    при загрузке недоверенных checkpoint-файлов. Допустимо только для моделей
-    из доверенных источников
-    (HuggingFace + официальные репозитории pyannote).
+    при загрузке недоверенных checkpoint-файлов. Окно ограничено загрузкой
+    моделей pyannote из доверенного репозитория HuggingFace — остальной код
+    процесса (в т.ч. долгоживущего трея) работает с безопасным умолчанием.
     """
     try:
         import torch
+    except ImportError:
+        yield
+        return
 
-        if getattr(torch, "_patched_weights_only", False):
-            return
-
-        _orig_load = torch.load
+    with _torch_load_lock:
+        original = torch.load
 
         def _patched_load(*args, **kwargs):
             kwargs.setdefault("weights_only", False)
-            return _orig_load(*args, **kwargs)
+            return original(*args, **kwargs)
 
         torch.load = _patched_load
-        torch._patched_weights_only = True
-    except Exception as e:
-        logger.debug("Патч torch.load не применён: %s", e)
+        try:
+            yield
+        finally:
+            torch.load = original
 
 
 def _patch_speechbrain_lazy_module() -> None:
@@ -225,7 +240,6 @@ def _get_diarization_model(cfg: AppConfig):
         try:
             _patch_torchaudio_compat()
             _patch_hf_use_auth_token()
-            _patch_torch_load_compat()
             _patch_speechbrain_lazy_module()
             from pyannote.audio import Pipeline
         except Exception as e:
@@ -242,10 +256,11 @@ def _get_diarization_model(cfg: AppConfig):
 
         logger.info("Загрузка pyannote.pipeline (device=%s)…", cfg.transcription.device)
         try:
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
-            )
+            with _trusted_torch_load():
+                pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=hf_token,
+                )
         except Exception as e:
             logger.warning("Не удалось загрузить pyannote pipeline: %s", e)
             _model_cache[key] = None  # кэшируем None, чтобы не повторять попытку
@@ -261,6 +276,71 @@ def _get_diarization_model(cfg: AppConfig):
         _model_cache[key] = pipeline
         logger.info("pyannote.pipeline загружена")
         return pipeline
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "alloc_failed" in msg
+
+
+def _batch_fallbacks(batch_size: int) -> list[int]:
+    """16 → [16, 8, 4, 0]: при OOM уменьшаем batch, в конце — без батчинга."""
+    sizes: list[int] = []
+    while batch_size >= _OOM_MIN_BATCH:
+        sizes.append(batch_size)
+        batch_size //= 2
+    if batch_size > 0 and not sizes:
+        sizes.append(batch_size)
+    sizes.append(0)
+    return sizes
+
+
+def _whisper_pass(model, audio, batch_size: int, kwargs: dict):
+    """Один проход Whisper. Сегменты собираются в список: faster-whisper
+    возвращает генератор, и ошибки (в т.ч. OOM) возникают при итерации."""
+    if batch_size > 0:
+        # BatchedInferencePipeline: параллельная обработка чанков — 3-5x
+        # быстрее на GPU без изменения качества (тот же beam search)
+        from faster_whisper import BatchedInferencePipeline
+
+        pipeline = BatchedInferencePipeline(model=model)
+        logger.info("Используется BatchedInferencePipeline (batch_size=%d)", batch_size)
+        segments_raw, info = pipeline.transcribe(audio, batch_size=batch_size, **kwargs)
+    else:
+        segments_raw, info = model.transcribe(audio, **kwargs)
+    return list(segments_raw), info
+
+
+def _transcribe_with_oom_fallback(model, audio, batch_size: int, kwargs: dict):
+    sizes = _batch_fallbacks(batch_size) if batch_size > 0 else [0]
+    for i, size in enumerate(sizes):
+        try:
+            return _whisper_pass(model, audio, size, kwargs)
+        except Exception as exc:
+            if not _is_out_of_memory(exc) or i == len(sizes) - 1:
+                raise
+            logger.warning(
+                "Нехватка видеопамяти при batch_size=%d — повторяю с batch_size=%d",
+                size,
+                sizes[i + 1],
+            )
+            _free_gpu_memory()
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _decode_audio(audio_path: Path):
+    """Декодировать аудио в моно float32 16 кГц (один раз для Whisper и pyannote).
+
+    Возвращает None, если декодирование недоступно — тогда модели читают файл
+    сами.
+    """
+    try:
+        from faster_whisper import decode_audio
+
+        return decode_audio(str(audio_path), sampling_rate=_SAMPLE_RATE)
+    except Exception as exc:
+        logger.debug("decode_audio недоступен (%s) — модели читают файл сами", exc)
+        return None
 
 
 class Segment:
@@ -350,20 +430,14 @@ def transcribe(
         ),
     )
 
-    if batch_size > 0:
-        # BatchedInferencePipeline: параллельная обработка чанков — 3-5x быстрее на GPU
-        # без изменения качества (тот же алгоритм, тот же beam search)
-        from faster_whisper import BatchedInferencePipeline
+    # Декодируем один раз: тот же массив (16 кГц моно, ~230 МБ на час) уходит
+    # и в Whisper, и в pyannote — без повторного чтения 48 кГц файла.
+    audio = _decode_audio(audio_path)
+    audio_input = audio if audio is not None else str(audio_path)
 
-        pipeline = BatchedInferencePipeline(model=model)
-        logger.info("Используется BatchedInferencePipeline (batch_size=%d)", batch_size)
-        segments_raw, info = pipeline.transcribe(
-            str(audio_path),
-            batch_size=batch_size,
-            **transcribe_kwargs,
-        )
-    else:
-        segments_raw, info = model.transcribe(str(audio_path), **transcribe_kwargs)
+    segments_raw, info = _transcribe_with_oom_fallback(
+        model, audio_input, batch_size, transcribe_kwargs
+    )
 
     # Собираем сегменты
     segments: list[Segment] = []
@@ -384,7 +458,9 @@ def transcribe(
     if tcfg.diarization:
         pipeline = _get_diarization_model(cfg)
         if pipeline is not None:
-            segments = _apply_diarization(pipeline, audio_path, segments, cfg)
+            segments = _apply_diarization(
+                pipeline, audio_path, segments, cfg, waveform=audio
+            )
             diarization_applied = True
         else:
             logger.warning(
@@ -421,26 +497,38 @@ def _apply_diarization(
     audio_path: Path,
     segments: list[Segment],
     cfg: AppConfig,
+    waveform=None,
 ) -> list[Segment]:
-    """Применить pyannote.audio диаризацию к сегментам Whisper."""
+    """Применить pyannote.audio диаризацию к сегментам Whisper.
+
+    Args:
+        waveform: уже декодированное аудио (моно float32, 16 кГц). Если задано,
+            pyannote не перечитывает файл (экономия памяти и времени).
+    """
     logger.info("Выполняю диаризацию на %s…", audio_path.name)
 
-    # pyannote 3.x: передаём путь напрямую
-    diarization = pipeline(str(audio_path))
+    if waveform is not None:
+        import torch
 
-    # Карта: segment_index → {speaker: суммарное перекрытие в секундах}
-    speaker_map: dict[int, dict[str, float]] = {i: {} for i in range(len(segments))}
+        audio_in: Any = {
+            "waveform": torch.from_numpy(waveform).unsqueeze(0),
+            "sample_rate": _SAMPLE_RATE,
+        }
+    else:
+        audio_in = str(audio_path)
+    diarization = pipeline(audio_in)
 
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        t_start, t_end = turn.start, turn.end
-        for i, seg in enumerate(segments):
-            overlap = min(seg.end, t_end) - max(seg.start, t_start)
-            if overlap > 0:
-                speaker_map[i][speaker] = speaker_map[i].get(speaker, 0.0) + overlap
+    turns = sorted(
+        (
+            (float(turn.start), float(turn.end), speaker)
+            for turn, _, speaker in diarization.itertracks(yield_label=True)
+        ),
+        key=lambda t: t[0],
+    )
+    overlaps_by_seg = _speaker_overlaps(segments, turns)
 
     # Назначаем говорящего с максимальным перекрытием (детерминированно)
-    for i, seg in enumerate(segments):
-        overlaps = speaker_map.get(i, {})
+    for seg, overlaps in zip(segments, overlaps_by_seg, strict=True):
         seg.speaker = max(overlaps, key=overlaps.__getitem__) if overlaps else "UNKNOWN"
 
     # Нормализуем имена говорящих (SPEAKER_00, SPEAKER_01, …)
@@ -455,6 +543,34 @@ def _apply_diarization(
 
     logger.info("Диаризация: %d уникальных говорящих", len(speaker_rename))
     return segments
+
+
+def _speaker_overlaps(
+    segments: list[Segment], turns: list[tuple[float, float, str]]
+) -> list[dict[str, float]]:
+    """Суммарное перекрытие каждого сегмента с репликами каждого говорящего.
+
+    Линейный проход «скользящим окном» вместо O(сегменты × реплики): сегменты
+    обходятся по возрастанию start; реплика попадает в окно, когда её start
+    меньше конца сегмента, и выбывает, когда закончилась до начала сегмента
+    (последующие сегменты начинаются не раньше — с ними она не пересечётся).
+    """
+    result: list[dict[str, float]] = [{} for _ in segments]
+    order = sorted(range(len(segments)), key=lambda i: segments[i].start)
+    active: list[tuple[float, float, str]] = []
+    nxt = 0
+    for i in order:
+        seg = segments[i]
+        while nxt < len(turns) and turns[nxt][0] < seg.end:
+            active.append(turns[nxt])
+            nxt += 1
+        active = [t for t in active if t[1] > seg.start]
+        acc = result[i]
+        for t_start, t_end, speaker in active:
+            overlap = min(seg.end, t_end) - max(seg.start, t_start)
+            if overlap > 0:
+                acc[speaker] = acc.get(speaker, 0.0) + overlap
+    return result
 
 
 def load_transcript(path: Path | str) -> dict[str, Any]:

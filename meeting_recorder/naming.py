@@ -62,11 +62,24 @@ class SessionPaths:
 
 
 def create_session(output_dir: str) -> SessionPaths:
-    """Создать новую сессию с уникальным session_id и вернуть SessionPaths."""
-    session_id = _ensure_unique_session_id(output_dir)
-    paths = SessionPaths(output_dir, session_id)
-    paths.ensure_dir()
-    return paths
+    """Создать новую сессию с уникальным session_id и вернуть SessionPaths.
+
+    Каталог создаётся через mkdir(exist_ok=False): проверка уникальности и
+    создание — одна атомарная операция ФС, поэтому два одновременных старта
+    (CLI и трей в одну секунду) не получат один и тот же каталог.
+    """
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    base_id = _generate_session_id(0)
+    idx = 1
+    while True:
+        session_id = base_id if idx == 1 else f"{base_id}_{idx}"
+        try:
+            (root / session_id).mkdir()
+        except FileExistsError:
+            idx += 1
+            continue
+        return SessionPaths(output_dir, session_id)
 
 
 def list_sessions(output_dir: str) -> list[SessionPaths]:

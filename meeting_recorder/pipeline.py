@@ -21,7 +21,11 @@ from .html_report import generate_html_protocol
 from .naming import SessionPaths, resolve_session
 from .recorder import mix_audio_files, mux_video, no_window_kwargs
 from .report import generate_highlights, generate_protocol, generate_summary
-from .session_utils import load_transcript_data, save_transcript_data
+from .session_utils import (
+    load_transcript_data,
+    replace_with_retry,
+    save_transcript_data,
+)
 from .transcriber import transcribe, unload_models
 
 logger = logging.getLogger(__name__)
@@ -99,14 +103,7 @@ def _rename_with_retry(
     src: Path, dst: Path, retries: int = 10, delay: float = 0.5
 ) -> None:
     """Переименовать файл с повторами (файл может быть временно заблокирован)."""
-    for attempt in range(retries):
-        try:
-            src.replace(dst)
-            return
-        except PermissionError:
-            if attempt == retries - 1:
-                raise
-            time.sleep(delay)
+    replace_with_retry(src, dst, retries=retries, delay=delay)
 
 
 # ---------------------------------------------------------------------------

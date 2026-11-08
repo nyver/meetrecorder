@@ -4,8 +4,10 @@
 аннотации параметров (Request импортируется внутри create_app).
 """
 
+import functools
 import json
 import logging
+import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,28 @@ def _parse_dt(session_id: str) -> datetime | None:
         return None
 
 
+@functools.lru_cache(maxsize=4096)
+def _transcript_stats_cached(
+    path: str, mtime_ns: int, size: int
+) -> tuple[float, tuple[str, ...]]:
+    """Длительность (мин) и сырые метки говорящих транскрипта.
+
+    Ключ кэша включает mtime и размер: изменённый файл перечитывается, а
+    главная страница не разбирает JSON всех встреч на каждый запрос.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    duration = round(float(data.get("duration_sec", 0) or 0) / 60, 1)
+    speakers = tuple(
+        sorted({str(seg.get("speaker", "?")) for seg in data.get("segments", [])})
+    )
+    return duration, speakers
+
+
+def _transcript_stats(path: Path) -> tuple[float, tuple[str, ...]]:
+    st = path.stat()
+    return _transcript_stats_cached(str(path), st.st_mtime_ns, st.st_size)
+
+
 def _session_meta(paths: SessionPaths, cfg: AppConfig) -> dict[str, Any]:
     """Собрать метаданные сессии для шаблона."""
     dt = _parse_dt(paths.session_id)
@@ -65,12 +89,9 @@ def _session_meta(paths: SessionPaths, cfg: AppConfig) -> dict[str, Any]:
 
     if paths.transcript.exists():
         try:
-            data = json.loads(paths.transcript.read_text(encoding="utf-8"))
-            meta["duration_min"] = round(data.get("duration_sec", 0) / 60, 1)
+            duration, unique = _transcript_stats(paths.transcript)
+            meta["duration_min"] = duration
             names = cfg.transcription.speaker_names
-            unique = sorted(
-                {seg.get("speaker", "?") for seg in data.get("segments", [])}
-            )
             meta["speakers"] = [names.get(s, s) for s in unique]
         except Exception:
             pass
@@ -108,18 +129,39 @@ def _pick_media(paths: SessionPaths) -> tuple[str, str] | None:
 
 
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+TOKEN_COOKIE = "mrec_token"
+TOKEN_PARAM = "token"
 
 
-def create_app(cfg: AppConfig, allowed_hosts: "list[str] | None" = None) -> Any:
+def _token_matches(supplied: str | None, expected: str) -> bool:
+    if not supplied:
+        return False
+    return secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
+def create_app(
+    cfg: AppConfig,
+    allowed_hosts: "list[str] | None" = None,
+    access_token: "str | None" = None,
+) -> Any:
     """Создать и вернуть FastAPI-приложение дашборда.
 
     Args:
         allowed_hosts: допустимые значения заголовка Host. Защищает от DNS
             rebinding (чужая веб-страница, резолвящая свой домен в 127.0.0.1,
             не сможет читать ответы дашборда). None — без проверки.
+        access_token: если задан, каждый запрос должен предъявить токен —
+            ``?token=…`` (один раз: затем ставится HttpOnly-cookie и
+            выполняется редирект на URL без токена) или cookie. Обязателен,
+            когда дашборд доступен из сети.
     """
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, HTMLResponse
+    from fastapi.responses import (
+        FileResponse,
+        HTMLResponse,
+        PlainTextResponse,
+        RedirectResponse,
+    )
     from fastapi.templating import Jinja2Templates
 
     from .html_report import _md_to_html
@@ -133,6 +175,24 @@ def create_app(cfg: AppConfig, allowed_hosts: "list[str] | None" = None) -> Any:
             TrustedHostMiddleware,
             allowed_hosts=sorted(set(allowed_hosts) | set(_LOOPBACK_HOSTS)),
         )
+    if access_token:
+
+        @app.middleware("http")
+        async def _require_token(request: Request, call_next):
+            if _token_matches(request.cookies.get(TOKEN_COOKIE), access_token):
+                return await call_next(request)
+            if _token_matches(request.query_params.get(TOKEN_PARAM), access_token):
+                # Убираем токен из URL (история браузера, Referer) → cookie
+                clean_url = str(request.url.remove_query_params(TOKEN_PARAM))
+                response = RedirectResponse(clean_url, status_code=303)
+                response.set_cookie(
+                    TOKEN_COOKIE, access_token, httponly=True, samesite="strict"
+                )
+                return response
+            return PlainTextResponse(
+                "401: требуется токен доступа (?token=…)", status_code=401
+            )
+
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
     templates.env.filters["ts"] = _fmt_ts
 

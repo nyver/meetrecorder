@@ -144,3 +144,68 @@ class TestPickMediaAndFences:
     def test_strip_code_fences(self):
         assert strip_code_fences("```json\n[1]\n```") == "[1]"
         assert strip_code_fences("  plain ") == "plain"
+
+
+# ---------------------------------------------------------------------------
+# replace_with_retry / atomic_write_text при блокировке файла
+# ---------------------------------------------------------------------------
+
+
+class TestReplaceWithRetry:
+    def test_retries_then_succeeds(self, tmp_path):
+        from unittest.mock import patch
+
+        from meeting_recorder import session_utils
+
+        src = tmp_path / "a"
+        dst = tmp_path / "b"
+        src.write_text("x", encoding="utf-8")
+        real_replace = session_utils.os.replace
+        calls = {"n": 0}
+
+        def flaky(a, b):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError("locked")
+            real_replace(a, b)
+
+        with patch("meeting_recorder.session_utils.os.replace", side_effect=flaky):
+            session_utils.replace_with_retry(src, dst, delay=0)
+        assert dst.read_text(encoding="utf-8") == "x"
+        assert calls["n"] == 3
+
+    def test_atomic_write_survives_transient_lock(self, tmp_path):
+        from unittest.mock import patch
+
+        from meeting_recorder import session_utils
+
+        target = tmp_path / "f.md"
+        target.write_text("old", encoding="utf-8")
+        real_replace = session_utils.os.replace
+        state = {"failed": False}
+
+        def flaky(a, b):
+            if not state["failed"]:
+                state["failed"] = True
+                raise PermissionError("locked")
+            real_replace(a, b)
+
+        with (
+            patch("meeting_recorder.session_utils.os.replace", side_effect=flaky),
+            patch("meeting_recorder.session_utils._REPLACE_DELAY", 0),
+        ):
+            session_utils.atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "new"
+        assert not list(tmp_path.glob(".f.md.*"))
+
+
+class TestNormalizeSegmentsTypes:
+    def test_coerces_types(self):
+        from meeting_recorder.session_utils import normalize_segments
+
+        segs = [{"start": "1);alert(1);//", "end": "00:05", "speaker": 3, "text": None}]
+        out = normalize_segments(segs)
+        assert out[0]["start"] == 0.0
+        assert out[0]["end"] == 5.0
+        assert out[0]["speaker"] == "3"
+        assert out[0]["text"] == ""

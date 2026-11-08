@@ -31,9 +31,12 @@ logger = logging.getLogger(__name__)
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 # Консервативная оценка: для кириллицы типичные BPE-токенизаторы (Qwen, Llama)
-# дают ~2.5–3.5 символа на токен, для латиницы ~4. Берём нижнюю границу,
-# чтобы не переполнить контекст.
-_CHARS_PER_TOKEN = 3.0
+# дают ~2.5–3.5 символа на токен, для латиницы ~4. Берём нижнюю границу
+# (больше токенов на тот же текст), чтобы не переполнить контекст.
+_CHARS_PER_TOKEN = 2.5
+# Если сервер всё же ответил «контекст переполнен» — повторяем с чанками
+# меньшего размера (доля от расчётного бюджета).
+_OVERFLOW_SCALES = (1.0, 0.5, 0.25)
 _MIN_CHUNK_CHARS = 2000
 _HIGHLIGHTS_COUNT = 5
 _MAX_REDUCE_ROUNDS = 5
@@ -75,8 +78,16 @@ def estimate_tokens(text: str) -> int:
     return int(len(text) / _CHARS_PER_TOKEN) + 1
 
 
+def _input_budget(cfg: AppConfig, scale: float = 1.0) -> int:
+    return int(cfg.llm.input_token_budget() * scale)
+
+
 def _chunk_chars(
-    cfg: AppConfig, template: str = "", *, output_bound: bool = False
+    cfg: AppConfig,
+    template: str = "",
+    *,
+    output_bound: bool = False,
+    scale: float = 1.0,
 ) -> int:
     """Максимальный размер чанка (в символах), помещающийся в контекст модели.
 
@@ -84,18 +95,38 @@ def _chunk_chars(
         template: шаблон промпта — его размер вычитается из бюджета.
         output_bound: ответ модели сопоставим по размеру со входом (чистка
             протокола) — чанк ограничивается ещё и лимитом max_tokens.
+        scale: доля бюджета (< 1 — повтор после переполнения контекста).
     """
-    budget = cfg.llm.input_token_budget() - estimate_tokens(template)
+    budget = _input_budget(cfg, scale) - estimate_tokens(template)
     if output_bound:
-        budget = min(budget, int(cfg.llm.max_tokens * 0.8))
+        budget = min(budget, int(cfg.llm.max_tokens * 0.8 * scale))
     return max(int(budget * _CHARS_PER_TOKEN), _MIN_CHUNK_CHARS)
 
 
-def _fits(text: str, cfg: AppConfig, template: str = "") -> bool:
-    return (
-        estimate_tokens(template) + estimate_tokens(text)
-        <= cfg.llm.input_token_budget()
+def _fits(text: str, cfg: AppConfig, template: str = "", scale: float = 1.0) -> bool:
+    return estimate_tokens(template) + estimate_tokens(text) <= _input_budget(
+        cfg, scale
     )
+
+
+def _with_overflow_fallback(what: str, func):
+    """Вызвать func(scale), уменьшая чанки при переполнении контекста модели."""
+    from .llm_client import LLMContextOverflowError
+
+    for i, scale in enumerate(_OVERFLOW_SCALES):
+        try:
+            return func(scale)
+        except LLMContextOverflowError as exc:
+            if i == len(_OVERFLOW_SCALES) - 1:
+                raise
+            logger.warning(
+                "%s: контекст модели переполнен (%s) — повторяю с частями "
+                "меньшего размера (%.0f%% бюджета). Проверьте llm.context_tokens.",
+                what,
+                exc,
+                _OVERFLOW_SCALES[i + 1] * 100,
+            )
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _pack(pieces: list[str], sep: str, max_chars: int) -> list[str]:
@@ -322,24 +353,30 @@ def _call_llm_for_summary(
     """Вызвать LLM для генерации summary, с chunking при необходимости."""
     from .llm_client import create_llm_client
 
-    budget = cfg.llm.input_token_budget()
     with create_llm_client(cfg.llm) as client:
-        if est_tokens + estimate_tokens(template) <= budget:
+
+        def attempt(scale: float) -> str:
+            budget = _input_budget(cfg, scale)
+            if est_tokens + estimate_tokens(template) <= budget:
+                logger.info(
+                    "Транскрипт помещается в контекстное окно (~%d из %d токенов)",
+                    est_tokens,
+                    budget,
+                )
+                return _chat_allow_truncated(
+                    client, _fill_template(template, meta, full_text)
+                )
             logger.info(
-                "Транскрипт помещается в контекстное окно (~%d из %d токенов)",
+                "Транскрипт превышает контекстное окно (~%d > %d токенов) — "
+                "применяю chunking",
                 est_tokens,
                 budget,
             )
-            return _chat_allow_truncated(
-                client, _fill_template(template, meta, full_text)
+            return _map_reduce_summary(
+                full_text, template, meta, cfg, client, scale=scale
             )
-        logger.info(
-            "Транскрипт превышает контекстное окно (~%d > %d токенов) — "
-            "применяю chunking",
-            est_tokens,
-            budget,
-        )
-        return _map_reduce_summary(full_text, template, meta, cfg, client)
+
+        return _with_overflow_fallback("Summary", attempt)
 
 
 _REDUCE_PROMPT = textwrap.dedent("""\
@@ -370,13 +407,16 @@ def _map_reduce_summary(
     meta: dict,
     cfg: AppConfig,
     client: LLMClient,
+    scale: float = 1.0,
 ) -> str:
     """Map-reduce: разбить на чанки → промежуточные резюме → агрегация.
 
     Если промежуточные резюме сами не помещаются в контекст, reduce выполняется
     в несколько раундов (иерархически).
     """
-    chunks = _split_text_into_chunks(full_text, _chunk_chars(cfg, template))
+    chunks = _split_text_into_chunks(
+        full_text, _chunk_chars(cfg, template, scale=scale)
+    )
 
     intermediate: list[str] = []
     for i, chunk in enumerate(chunks):
@@ -406,10 +446,12 @@ def _map_reduce_summary(
         aggregated = "\n\n".join(intermediate)
         if len(intermediate) == 1 and round_no > 1:
             return intermediate[0]
-        if _fits(aggregated, cfg, base_prompt):
+        if _fits(aggregated, cfg, base_prompt, scale):
             logger.info("Reduce: агрегация %d промежуточных резюме", len(intermediate))
             return _reduce(intermediate)
-        groups = _pack(intermediate, "\n\n", _chunk_chars(cfg, base_prompt))
+        groups = _pack(
+            intermediate, "\n\n", _chunk_chars(cfg, base_prompt, scale=scale)
+        )
         logger.info(
             "Reduce раунд %d: %d резюме → %d групп",
             round_no,
@@ -496,6 +538,36 @@ def _select_top_highlights(
     return [candidates[int(i * step)] for i in range(_HIGHLIGHTS_COUNT)]
 
 
+def _highlights_attempt(
+    client: LLMClient,
+    template: str,
+    transcript_text: str,
+    cfg: AppConfig,
+    scale: float,
+) -> list[dict[str, Any]]:
+    """Одна попытка генерации highlights при заданной доле бюджета контекста."""
+    from .llm_client import LLMClientError, LLMContextOverflowError
+
+    if _fits(transcript_text, cfg, template, scale):
+        return _ask_highlights(client, template, transcript_text)
+
+    chunks = _split_text_into_chunks(
+        transcript_text, _chunk_chars(cfg, template, scale=scale)
+    )
+    logger.info("Highlights: транскрипт длинный — обрабатываю %d частей", len(chunks))
+    candidates: list[dict[str, Any]] = []
+    for i, chunk in enumerate(chunks, 1):
+        try:
+            candidates.extend(_ask_highlights(client, template, chunk))
+        except LLMContextOverflowError:
+            raise  # повтор с более мелкими частями — в _with_overflow_fallback
+        except (ValueError, LLMClientError) as exc:
+            logger.warning("Highlights: часть %d/%d пропущена: %s", i, len(chunks), exc)
+    if not candidates:
+        raise ValueError("LLM не вернул ни одного ключевого момента")
+    return _select_top_highlights(client, candidates)
+
+
 def generate_highlights(
     transcript: dict[str, Any] | Path | str,
     paths: SessionPaths,
@@ -506,7 +578,7 @@ def generate_highlights(
     Сохраняет JSON-список [{title, description, start}] в *_highlights.json.
     Длинные транскрипты обрабатываются по частям с последующим отбором лучших.
     """
-    from .llm_client import LLMClientError, create_llm_client
+    from .llm_client import create_llm_client
 
     data = load_transcript_data(transcript)
     lines = transcript_lines(
@@ -518,26 +590,12 @@ def generate_highlights(
     template = _read_prompt("highlights.md")
 
     with create_llm_client(cfg.llm) as client:
-        if _fits(transcript_text, cfg, template):
-            highlights = _ask_highlights(client, template, transcript_text)
-        else:
-            chunks = _split_text_into_chunks(
-                transcript_text, _chunk_chars(cfg, template)
-            )
-            logger.info(
-                "Highlights: транскрипт длинный — обрабатываю %d частей", len(chunks)
-            )
-            candidates: list[dict[str, Any]] = []
-            for i, chunk in enumerate(chunks, 1):
-                try:
-                    candidates.extend(_ask_highlights(client, template, chunk))
-                except (ValueError, LLMClientError) as exc:
-                    logger.warning(
-                        "Highlights: часть %d/%d пропущена: %s", i, len(chunks), exc
-                    )
-            if not candidates:
-                raise ValueError("LLM не вернул ни одного ключевого момента")
-            highlights = _select_top_highlights(client, candidates)
+        highlights = _with_overflow_fallback(
+            "Highlights",
+            lambda scale: _highlights_attempt(
+                client, template, transcript_text, cfg, scale
+            ),
+        )
 
     atomic_write_text(
         paths.highlights, json.dumps(highlights, ensure_ascii=False, indent=2)

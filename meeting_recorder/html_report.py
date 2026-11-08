@@ -361,12 +361,25 @@ def _render(
 _HIGHLIGHT_JS = """
 var _player = document.getElementById('player');
 if (_player) {
+  var _segEls = Array.prototype.slice.call(document.querySelectorAll('.seg'));
+  var _starts = _segEls.map(function (el) { return parseFloat(el.dataset.start); });
+  var _ends = _segEls.map(function (el) { return parseFloat(el.dataset.end); });
+  var _cur = -1;
+  // Бинарный поиск: сегменты упорядочены по start
+  function _locate(t) {
+    var lo = 0, hi = _starts.length - 1, ans = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (_starts[mid] <= t) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return ans !== -1 && t < _ends[ans] ? ans : -1;
+  }
   _player.addEventListener('timeupdate', function () {
-    var t = _player.currentTime;
-    document.querySelectorAll('.seg').forEach(function (el) {
-      var s = parseFloat(el.dataset.start), e = parseFloat(el.dataset.end);
-      el.classList.toggle('active', t >= s && t < e);
-    });
+    var idx = _locate(_player.currentTime);
+    if (idx === _cur) return;
+    if (_cur !== -1) _segEls[_cur].classList.remove('active');
+    if (idx !== -1) _segEls[idx].classList.add('active');
+    _cur = idx;
   });
 }
 """
@@ -461,7 +474,7 @@ summary{{cursor:pointer;user-select:none;font-size:.95rem;font-weight:600}}
 
   <div class="controls">
     <input class="search" type="search" placeholder="Поиск по тексту…"
-           oninput="filterAll()">
+           oninput="clearTimeout(window._ft);window._ft=setTimeout(filterAll,150)">
     <div class="sp-filter" id="sp-filter">{sp_buttons}</div>
   </div>
 

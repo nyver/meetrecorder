@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,32 @@ from .naming import SessionPaths
 logger = logging.getLogger(__name__)
 
 TranscriptSource = dict[str, Any] | Path | str
+
+
+_REPLACE_RETRIES = 10
+_REPLACE_DELAY = 0.3  # секунд между попытками
+
+
+def replace_with_retry(
+    src: Path | str,
+    dst: Path | str,
+    retries: int = _REPLACE_RETRIES,
+    delay: float = _REPLACE_DELAY,
+) -> None:
+    """os.replace с повторами при PermissionError.
+
+    На Windows замена падает, пока целевой файл открыт другим процессом без
+    FILE_SHARE_DELETE (дашборд отдаёт файл, антивирус, индексатор). Обычно
+    блокировка снимается за доли секунды.
+    """
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt >= retries - 1:
+                raise
+            time.sleep(delay)
 
 
 def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
@@ -29,7 +56,7 @@ def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     try:
         with os.fdopen(fd, "w", encoding=encoding, newline="") as fh:
             fh.write(text)
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -111,17 +138,21 @@ def normalize_segments(
     segments: Iterable[dict[str, Any]],
     speaker_names: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Copy transcript segments and apply configured speaker aliases."""
+    """Copy transcript segments and apply configured speaker aliases.
+
+    Таймкоды приводятся к float, текст и метки — к str: данные из JSON
+    подставляются в HTML/JS (onclick="seek(...)"), поэтому типы проверяются.
+    """
     aliases = speaker_names or {}
     normalized: list[dict[str, Any]] = []
     for seg in segments:
-        speaker = seg.get("speaker", "UNKNOWN")
+        speaker = str(seg.get("speaker", "UNKNOWN"))
         normalized.append(
             {
-                "start": seg["start"],
-                "end": seg["end"],
-                "speaker": aliases.get(speaker, speaker),
-                "text": seg.get("text", "").strip(),
+                "start": parse_seconds(seg["start"]),
+                "end": parse_seconds(seg["end"]),
+                "speaker": str(aliases.get(speaker, speaker)),
+                "text": str(seg.get("text", "") or "").strip(),
             }
         )
     return normalized

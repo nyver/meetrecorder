@@ -361,3 +361,74 @@ class TestTrustedHosts:
         assert client.get("/", headers={"host": "evil.example.com"}).status_code == 400
         assert client.get("/", headers={"host": "127.0.0.1:7070"}).status_code == 200
         assert client.get("/", headers={"host": "localhost"}).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Токен доступа и кэш метаданных
+# ---------------------------------------------------------------------------
+
+
+class TestAccessToken:
+    def _client(self, cfg):
+        from starlette.testclient import TestClient
+
+        from meeting_recorder.dashboard import create_app
+
+        return TestClient(create_app(cfg, access_token="tok-123"))
+
+    def test_without_token_401(self, cfg):
+        resp = self._client(cfg).get("/")
+        assert resp.status_code == 401
+
+    def test_wrong_token_401(self, cfg):
+        resp = self._client(cfg).get("/?token=nope")
+        assert resp.status_code == 401
+
+    def test_token_query_sets_cookie_and_redirects(self, cfg):
+        client = self._client(cfg)
+        resp = client.get("/?token=tok-123", follow_redirects=False)
+        assert resp.status_code == 303
+        assert "token=" not in resp.headers["location"]
+        assert "mrec_token=tok-123" in resp.headers["set-cookie"]
+        assert "httponly" in resp.headers["set-cookie"].lower()
+        # cookie сохранена клиентом — следующие запросы проходят
+        assert client.get("/").status_code == 200
+
+    def test_media_requires_token(self, cfg):
+        paths = create_session(cfg.output_dir)
+        paths.mix_audio.write_bytes(b"RIFF")
+        client = self._client(cfg)
+        url = f"/media/{paths.session_id}/{paths.mix_audio.name}"
+        assert client.get(url).status_code == 401
+        client.get("/?token=tok-123")
+        assert client.get(url).status_code == 200
+
+    def test_non_ascii_token_rejected_without_error(self, cfg):
+        resp = self._client(cfg).get("/?token=%D1%82%D0%BE%D0%BA%D0%B5%D0%BD")
+        assert resp.status_code == 401
+
+
+class TestTranscriptStatsCache:
+    def test_cached_until_file_changes(self, cfg):
+        from meeting_recorder import dashboard as dash
+
+        paths = create_session(cfg.output_dir)
+        data = {"duration_sec": 120, "segments": [{"speaker": "SPEAKER_00"}]}
+        paths.transcript.write_text(json.dumps(data), encoding="utf-8")
+        dash._transcript_stats_cached.cache_clear()
+
+        assert dash._transcript_stats(paths.transcript) == (2.0, ("SPEAKER_00",))
+        assert dash._transcript_stats(paths.transcript) == (2.0, ("SPEAKER_00",))
+        assert dash._transcript_stats_cached.cache_info().hits == 1
+
+        data["segments"].append({"speaker": "SPEAKER_01"})
+        data["duration_sec"] = 600
+        paths.transcript.write_text(json.dumps(data), encoding="utf-8")
+        import os
+
+        st = paths.transcript.stat()
+        os.utime(paths.transcript, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        assert dash._transcript_stats(paths.transcript) == (
+            10.0,
+            ("SPEAKER_00", "SPEAKER_01"),
+        )

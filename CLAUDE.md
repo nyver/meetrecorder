@@ -28,6 +28,7 @@ meeting_recorder/
 ├── dashboard.py    # FastAPI веб-дашборд
 ├── pipeline.py     # Оркестрация пайплайна (finalize_recording, process_session, run_*)
 ├── session_utils.py # Общие хелперы артефактов (атомарная запись, транскрипт, highlights)
+├── state.py        # Состояние записи и межпроцессный lock (общий для CLI и трея)
 ├── tray.py         # Иконка в трее (pystray + Pillow)
 ├── templates/      # Jinja2-шаблоны для дашборда
 └── prompts/        # Промпты для LLM (summary, highlights, protocol_clean)

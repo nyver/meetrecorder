@@ -958,3 +958,95 @@ class TestHighlightsMapReduce:
         ]
         assert [h["title"] for h in _select_top_highlights(client, cands)] == ["b", "a"]
         client.chat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Переполнение контекста: повтор с более мелкими частями
+# ---------------------------------------------------------------------------
+
+
+class TestContextOverflowFallback:
+    def _paths(self, tmp_path):
+        p = SessionPaths(str(tmp_path), "meeting_2026-06-28_10-00-00")
+        p.ensure_dir()
+        return p
+
+    def _transcript(self, n=40):
+        return {
+            "duration_sec": n * 10.0,
+            "segments": [
+                {
+                    "start": float(i * 10),
+                    "end": float(i * 10 + 9),
+                    "speaker": "S",
+                    "text": "слово " * 30,
+                }
+                for i in range(n)
+            ],
+        }
+
+    def test_summary_retries_with_smaller_chunks(self, tmp_path):
+        from meeting_recorder.llm_client import LLMContextOverflowError
+        from meeting_recorder.report import generate_summary
+
+        prompts: list[str] = []
+
+        def _chat(msgs):
+            prompt = msgs[0]["content"]
+            prompts.append(prompt)
+            if len(prompt) > 6000:
+                raise LLMContextOverflowError("exceeds the available context size")
+            return "## Резюме\nок"
+
+        cfg = AppConfig()
+        cfg.llm.context_tokens = 8192
+        cfg.llm.max_tokens = 1024
+        client = _ctx_client(_chat)
+        with patch(
+            "meeting_recorder.llm_client.create_llm_client", return_value=client
+        ):
+            out = generate_summary(self._transcript(), self._paths(tmp_path), cfg)
+        assert out.read_text(encoding="utf-8").startswith("## Резюме")
+        assert any(len(p) > 6000 for p in prompts)  # первая попытка переполнилась
+
+    def test_summary_overflow_on_all_scales_raises(self, tmp_path):
+        from meeting_recorder.llm_client import LLMContextOverflowError
+        from meeting_recorder.report import generate_summary
+
+        def _chat(msgs):
+            raise LLMContextOverflowError("maximum context length")
+
+        client = _ctx_client(_chat)
+        with patch(
+            "meeting_recorder.llm_client.create_llm_client", return_value=client
+        ):
+            with pytest.raises(LLMContextOverflowError):
+                generate_summary(
+                    self._transcript(5), self._paths(tmp_path), AppConfig()
+                )
+
+    def test_highlights_retry_on_overflow(self, tmp_path):
+        from meeting_recorder.llm_client import LLMContextOverflowError
+
+        attempts = {"n": 0}
+
+        def _chat(msgs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise LLMContextOverflowError("context window exceeded")
+            return json.dumps([{"title": "T", "description": "d", "start": 5}])
+
+        client = _ctx_client(_chat)
+        with patch(
+            "meeting_recorder.llm_client.create_llm_client", return_value=client
+        ):
+            out = generate_highlights(
+                self._transcript(3), self._paths(tmp_path), AppConfig()
+            )
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data[0]["title"] == "T"
+
+    def test_chunk_chars_scales(self):
+        cfg = AppConfig()
+        cfg.llm.context_tokens = 65536
+        assert _chunk_chars(cfg, scale=0.5) < _chunk_chars(cfg)

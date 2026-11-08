@@ -112,7 +112,7 @@ class TestRenameWithRetry:
         dst = tmp_path / "b.txt"
         src.write_text("hello")
         with patch(
-            "meeting_recorder.pipeline.Path.replace",
+            "meeting_recorder.session_utils.os.replace",
             side_effect=PermissionError("locked"),
         ):
             with pytest.raises(PermissionError):
@@ -185,6 +185,32 @@ class TestLoadActiveSession:
         _save_state("meeting_1900-01-01_00-00-00", "/tmp/v.mp4", 99)
         sid, pid, paths = _load_active_session(mock_cfg)
         assert sid is None
+
+    def test_tray_recording_not_stopped_from_cli(self, tmp_session, mock_cfg, capsys):
+        """Запись идёт из трея (lock занят) — mrec stop не трогает её."""
+        from meeting_recorder import state
+
+        state.save_state(
+            tmp_session.session_id, str(tmp_session.video), 1, owner=state.OWNER_TRAY
+        )
+        held = state.acquire_recording_lock()
+        try:
+            sid, pid, paths = _load_active_session(mock_cfg)
+        finally:
+            state.release_recording_lock(held)
+        assert paths is None
+        assert "трея" in capsys.readouterr().out
+        assert state.load_state() is not None  # state трея не удалён
+
+    def test_stale_tray_state_is_stoppable(self, tmp_session, mock_cfg):
+        """Трей упал (lock свободен) — CLI может добить осиротевший ffmpeg."""
+        from meeting_recorder import state
+
+        state.save_state(
+            tmp_session.session_id, str(tmp_session.video), 77, owner=state.OWNER_TRAY
+        )
+        sid, pid, paths = _load_active_session(mock_cfg)
+        assert sid == tmp_session.session_id and pid == 77
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +340,23 @@ class TestGenerateConfigCmd:
         )
         assert result.exit_code == 0
         assert Path(out).exists()
+
+    def test_refuses_to_overwrite_existing(self, runner, tmp_path):
+        out = tmp_path / "config.yaml"
+        out.write_text("output_dir: D:/Mine\n", encoding="utf-8")
+        result = runner.invoke(cli, ["generate-config", "-o", str(out)])
+        assert result.exit_code == 1
+        assert "уже существует" in result.output
+        assert out.read_text(encoding="utf-8") == "output_dir: D:/Mine\n"
+
+    def test_force_overwrites(self, runner, tmp_path):
+        out = tmp_path / "config.yaml"
+        out.write_text("output_dir: D:/Mine\n", encoding="utf-8")
+        result = runner.invoke(
+            cli, ["generate-config", "-o", str(out), "--force"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+        assert "D:/Mine" not in out.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +643,8 @@ class TestSignalStopAlive:
         with patch("meeting_recorder.__main__._stop_ffmpeg_graceful") as kill:
             with patch("meeting_recorder.__main__.time.sleep"):
                 with patch(
-                    "meeting_recorder.__main__.time.monotonic", side_effect=[0, 31]
+                    "meeting_recorder.__main__.time.monotonic",
+                    side_effect=[0, main_mod._STOP_WAIT_SECS + 1],
                 ):
                     main_mod._signal_stop_and_wait(1234)
         kill.assert_called_once_with(1234)
@@ -793,8 +837,22 @@ class TestMiscCommands:
                     runner, ["serve", "--host", "0.0.0.0", "--no-open"], mock_cfg
                 )
         run.assert_called_once()
-        assert "аутентификации нет" in result.output
+        assert "токен" in result.output
         assert create.call_args.kwargs["allowed_hosts"] is None
+        token = create.call_args.kwargs["access_token"]
+        assert token and len(token) >= 20
+        assert f"?token={token}" in result.output
+
+    def test_serve_public_uses_given_token(self, runner, mock_cfg):
+        pytest.importorskip("uvicorn")
+        with patch("uvicorn.run"):
+            with patch("meeting_recorder.dashboard.create_app") as create:
+                _invoke(
+                    runner,
+                    ["serve", "--host", "0.0.0.0", "--token", "s3cret", "--no-open"],
+                    mock_cfg,
+                )
+        assert create.call_args.kwargs["access_token"] == "s3cret"
 
     def test_serve_local_sets_allowed_hosts(self, runner, mock_cfg):
         pytest.importorskip("uvicorn")
@@ -802,3 +860,4 @@ class TestMiscCommands:
             with patch("meeting_recorder.dashboard.create_app") as create:
                 _invoke(runner, ["serve", "--no-open"], mock_cfg)
         assert create.call_args.kwargs["allowed_hosts"] == ["127.0.0.1"]
+        assert create.call_args.kwargs["access_token"] is None

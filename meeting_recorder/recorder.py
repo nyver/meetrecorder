@@ -16,6 +16,7 @@ import soundfile as sf
 
 from .config import AppConfig
 from .naming import SessionPaths
+from .session_utils import replace_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ _SYS_AUDIO_JOIN_TIMEOUT = 10  # секунд ждать завершения п�
 _SYS_AUDIO_GAP_TOLERANCE = 0.5  # секунд: разрыв больше — дополняем тишиной
 _DEVICE_LIST_TIMEOUT = 5  # секунд на ffmpeg -list_devices
 _MUX_TIMEOUT = 1800  # секунд на mux (AAC-кодирование длинной встречи)
+_MIX_BLOCK_FRAMES = 1 << 18  # ~5.5 с при 48 кГц: блок потокового сведения
 
 
 def no_window_kwargs() -> dict:
@@ -231,72 +233,120 @@ def default_soundcard_speaker() -> AudioDevice | None:
 # ---------------------------------------------------------------------------
 
 
+def _resample_with_ffmpeg(src: Path, sample_rate: int) -> Path:
+    """Пересэмплировать WAV во временный моно-файл через ffmpeg (потоково)."""
+    tmp = src.with_name(f".{src.stem}.{sample_rate}hz.wav")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostats",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-c:a",
+        "pcm_s16le",
+        str(tmp),
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_MUX_TIMEOUT,
+        **no_window_kwargs(),
+    )
+    if result.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Не удалось пересэмплировать {src.name}: {result.stderr[-500:]}"
+        )
+    return tmp
+
+
 def mix_audio_files(
     mic_path: Path,
     system_path: Path,
     output_path: Path,
     sample_rate: int = 48000,
 ) -> Path:
-    """Свести два WAV-файла в один (смешивание по среднему)."""
-    data_mic, sr_mic = sf.read(mic_path, dtype="float32")
-    data_sys, sr_sys = sf.read(system_path, dtype="float32")
+    """Свести два WAV-файла в один моно-файл (смешивание по среднему).
 
-    if len(data_mic) == 0 or len(data_sys) == 0:
+    Обработка потоковая, блоками по _MIX_BLOCK_FRAMES: память не зависит от
+    длительности встречи. Результат пишется во временный файл и атомарно
+    переименовывается — недописанный mix не останется на диске.
+    """
+    mic_path, system_path, output_path = (
+        Path(mic_path),
+        Path(system_path),
+        Path(output_path),
+    )
+    info_mic = sf.info(str(mic_path))
+    info_sys = sf.info(str(system_path))
+    if info_mic.frames == 0 or info_sys.frames == 0:
         raise ValueError("Один из аудиофайлов пустой")
 
-    # Привести к общей частоте
-    if sr_mic != sr_sys:
-        try:
-            import resampy
-
+    sr = info_mic.samplerate
+    resampled: Path | None = None
+    tmp_out = output_path.with_name(f".{output_path.stem}.part.wav")
+    try:
+        if info_sys.samplerate != sr:
             logger.info(
-                "Ресемплинг системного аудио: %d → %d Гц",
-                sr_sys,
-                sr_mic,
+                "Ресемплинг системного аудио: %d → %d Гц", info_sys.samplerate, sr
             )
-            data_sys = resampy.resample(data_sys, sr_sys, sr_mic)
-        except ImportError as exc:
-            raise RuntimeError(
-                "Несовпадение частот дискретизации "
-                f"(mic={sr_mic} Гц, system={sr_sys} Гц). "
-                "Установите resampy для автоматического ресемплинга: "
-                "pip install resampy"
-            ) from exc
+            resampled = _resample_with_ffmpeg(system_path, sr)
+            system_path = resampled
+            info_sys = sf.info(str(system_path))
 
-    # Выравниваем по концу записи, а не по началу.
-    # soundcard стартует раньше ffmpeg (~2-5 с на инициализацию gdigrab/dshow),
-    # поэтому _system.wav длиннее — лишние кадры в начале, а не в конце.
-    # Обрезаем лишнее с начала более длинного файла.
-    len_diff = len(data_sys) - len(data_mic)
-    if len_diff > 0:
-        data_sys = data_sys[len_diff:]
-        logger.debug(
-            "Синхронизация аудио: обрезано %d кадров (%.2f с) с начала system",
-            len_diff,
-            len_diff / sr_mic,
-        )
-    elif len_diff < 0:
-        data_mic = data_mic[-len_diff:]
-        logger.debug(
-            "Синхронизация аудио: обрезано %d кадров (%.2f с) с начала mic",
-            -len_diff,
-            -len_diff / sr_mic,
-        )
+        # Выравниваем по концу записи, а не по началу.
+        # soundcard стартует раньше ffmpeg (~2-5 с на инициализацию gdigrab/dshow),
+        # поэтому _system.wav длиннее — лишние кадры в начале, а не в конце.
+        # Пропускаем лишнее с начала более длинного файла.
+        skip_mic = max(info_mic.frames - info_sys.frames, 0)
+        skip_sys = max(info_sys.frames - info_mic.frames, 0)
+        if skip_mic or skip_sys:
+            logger.debug(
+                "Синхронизация аудио: пропущено %.2f с с начала %s",
+                max(skip_mic, skip_sys) / sr,
+                "mic" if skip_mic else "system",
+            )
+        remaining = min(info_mic.frames, info_sys.frames)
 
-    # Привести оба потока к моно перед смешиванием
-    if data_mic.ndim > 1:
-        data_mic = data_mic[:, :1]
-    else:
-        data_mic = data_mic[:, np.newaxis]
-    if data_sys.ndim > 1:
-        data_sys = data_sys[:, :1]
-    else:
-        data_sys = data_sys[:, np.newaxis]
+        with (
+            sf.SoundFile(str(mic_path)) as f_mic,
+            sf.SoundFile(str(system_path)) as f_sys,
+            sf.SoundFile(
+                str(tmp_out),
+                mode="w",
+                samplerate=sr,
+                channels=1,
+                subtype="PCM_16",
+                format="WAV",
+            ) as out,
+        ):
+            f_mic.seek(skip_mic)
+            f_sys.seek(skip_sys)
+            while remaining > 0:
+                n = min(_MIX_BLOCK_FRAMES, remaining)
+                a = f_mic.read(n, dtype="float32", always_2d=True)[:, 0]
+                b = f_sys.read(n, dtype="float32", always_2d=True)[:, 0]
+                m = min(len(a), len(b))
+                if m == 0:
+                    break
+                out.write((a[:m] + b[:m]) * 0.5)
+                remaining -= m
 
-    # Свести по среднему
-    mixed = (data_mic + data_sys) / 2
+        replace_with_retry(tmp_out, output_path)
+    finally:
+        tmp_out.unlink(missing_ok=True)
+        if resampled is not None:
+            resampled.unlink(missing_ok=True)
 
-    sf.write(str(output_path), mixed, sr_mic, subtype="PCM_16")
     logger.info("Сведённое аудио сохранено: %s", output_path)
     return output_path
 
@@ -637,10 +687,19 @@ def mux_video(
     audio_path: Path,
     output_path: Path,
 ) -> Path:
-    """Объединить видео и аудио в один MP4-файл (без перекодирования видео)."""
+    """Объединить видео и аудио в один MP4-файл (без перекодирования видео).
+
+    ffmpeg пишет во временный *.part.mp4, который переименовывается только
+    после успешного завершения: недописанный файл не выдаёт себя за готовый.
+    """
+    output_path = Path(output_path)
+    tmp = output_path.with_name(f"{output_path.stem}.part{output_path.suffix}")
     cmd = [
         "ffmpeg",
         "-y",
+        "-nostats",
+        "-loglevel",
+        "error",
         "-i",
         str(video_path),
         "-i",
@@ -652,18 +711,24 @@ def mux_video(
         "-b:a",
         "192k",
         "-shortest",
-        str(output_path),
+        str(tmp),
     ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=_MUX_TIMEOUT,
-        **no_window_kwargs(),
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg завершился с ошибкой:\n{result.stderr[-1000:]}")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_MUX_TIMEOUT,
+            **no_window_kwargs(),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "ffmpeg завершился с ошибкой:\n" + (result.stderr or "")[-1000:]
+            )
+        replace_with_retry(tmp, output_path)
+    finally:
+        tmp.unlink(missing_ok=True)
     logger.info("Финальное видео сохранено: %s", output_path)
     return output_path

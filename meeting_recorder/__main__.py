@@ -23,6 +23,7 @@ if sys.platform == "win32":
 import click  # noqa: E402
 
 from meeting_recorder import __version__  # noqa: E402
+from meeting_recorder import state as _state  # noqa: E402
 from meeting_recorder.config import AppConfig, load_config, resolve_config_path  # noqa: E402
 from meeting_recorder.naming import list_sessions, resolve_session  # noqa: E402
 from meeting_recorder.pipeline import (  # noqa: E402
@@ -48,30 +49,12 @@ _USER_ERRORS = (PipelineError, FileNotFoundError)
 
 
 def _app_data_dir() -> Path:
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        return (
-            Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-        ) / "MeetingRecorder"
-    xdg = os.environ.get("XDG_STATE_HOME")
-    return (Path(xdg) if xdg else Path.home() / ".local" / "state") / "MeetingRecorder"
+    return _state.app_data_dir()
 
 
 def _default_state_dir() -> Path:
     """Вернуть user-writable директорию для файлов состояния."""
-    override = os.environ.get("MEETING_RECORDER_STATE_DIR")
-    if override:
-        return Path(override)
-
-    candidate = _app_data_dir() / ".state"
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        probe = candidate / ".write_test"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink(missing_ok=True)
-        return candidate
-    except OSError:
-        return Path.cwd() / ".meeting_recorder_state"
+    return _state.default_state_dir()
 
 
 def _default_log_file() -> Path:
@@ -82,13 +65,16 @@ def _default_log_file() -> Path:
     return _app_data_dir() / "logs" / "meeting_recorder.log"
 
 
-_STATE_DIR = _default_state_dir()
-_STATE_FILE = _STATE_DIR / "active_session.json"
-_STOP_FILE = _STATE_DIR / "stop_requested"
-_DONE_FILE = _STATE_DIR / "recording_done"
-_LOCK_FILE = _STATE_DIR / "recording.lock"
+_STATE_DIR = _state.STATE_DIR
+_STATE_FILE = _state.STATE_FILE
+_STOP_FILE = _state.STOP_FILE
+_DONE_FILE = _state.DONE_FILE
+_LOCK_FILE = _state.LOCK_FILE
 
-_STOP_WAIT_SECS = 30  # ожидание завершения `mrec start` после stop-сигнала
+# Ожидание завершения `mrec start` после stop-сигнала. С запасом больше худшего
+# случая MeetingRecorder.stop(): graceful 10 + terminate 5 + kill 5 + поток
+# системного звука 10 = 30 с.
+_STOP_WAIT_SECS = 45
 
 
 def _ensure_state_dir() -> None:
@@ -98,98 +84,37 @@ def _ensure_state_dir() -> None:
 def _save_state(
     session_id: str, video_path: str, ffmpeg_pid: int | None = None
 ) -> None:
-    _ensure_state_dir()
-    _STATE_FILE.write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "video_path": video_path,
-                "ffmpeg_pid": ffmpeg_pid,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    _state.save_state(session_id, video_path, ffmpeg_pid, path=_STATE_FILE)
 
 
 def _load_state() -> dict | None:
-    if not _STATE_FILE.exists():
-        return None
-    try:
-        return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+    return _state.load_state(_STATE_FILE)
 
 
 def _remove_state() -> None:
-    try:
-        _STATE_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
+    _state.remove_state(_STATE_FILE)
 
 
 # ---------------------------------------------------------------------------
-# Lock-файл процесса `mrec start`
+# Lock записи (общий с треем, см. meeting_recorder.state)
 # ---------------------------------------------------------------------------
-# Пока `mrec start` жив, он удерживает эксклюзивную блокировку на _LOCK_FILE.
-# ОС снимает блокировку при завершении процесса (в т.ч. аварийном), поэтому
-# состояние «запись идёт» нельзя спутать с устаревшим state-файлом.
 
-
-def _try_lock(fh: IO) -> bool:
-    try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
-
-
-def _unlock(fh: IO) -> None:
-    try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
+_try_lock = _state.try_lock
+_unlock = _state.unlock
 
 
 def _acquire_start_lock() -> IO | None:
     """Захватить lock записи. Возвращает дескриптор или None, если lock занят."""
-    _ensure_state_dir()
-    fh = open(_LOCK_FILE, "a+", encoding="utf-8")
-    if _try_lock(fh):
-        return fh
-    fh.close()
-    return None
+    return _state.acquire_recording_lock(_LOCK_FILE)
 
 
 def _release_start_lock(fh: IO | None) -> None:
-    if fh is not None:
-        _unlock(fh)
-        fh.close()
+    _state.release_recording_lock(fh)
 
 
 def _is_recorder_alive() -> bool:
-    """True, если процесс `mrec start` сейчас работает (держит lock)."""
-    fh = _acquire_start_lock()
-    if fh is None:
-        return True
-    _release_start_lock(fh)
-    return False
+    """True, если процесс записи (`mrec start` или трей) сейчас работает."""
+    return _state.is_recording_active(_LOCK_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +293,7 @@ def start(ctx):
 
     lock = _acquire_start_lock()
     if lock is None:
-        print("⚠️ Уже идёт запись (другой процесс mrec start).")
+        print("⚠️ Уже идёт запись (другой процесс mrec start или трей).")
         return
 
     recorder = None
@@ -476,6 +401,10 @@ def _load_active_session(cfg) -> tuple[str | None, int | None, object | None]:
 
     session_id = state.get("session_id")
     ffmpeg_pid = state.get("ffmpeg_pid")
+
+    if state.get("owner") == _state.OWNER_TRAY and _is_recorder_alive():
+        print(f"⚠️ Запись {session_id} ведётся из трея — остановите её в меню трея.")
+        return None, None, None
 
     if not session_id:
         print("⚠️ Состояние записи повреждено. Удалите .state/active_session.json")
@@ -941,12 +870,20 @@ def html_cmd(ctx, session_id: str | None):
     default=True,
     help="Открыть браузер автоматически",
 )
+@click.option(
+    "--token",
+    default=None,
+    help="Токен доступа. Для не-локального --host генерируется автоматически.",
+)
 @click.pass_context
-def serve_cmd(ctx, host: str, port: int, open_browser: bool):
+def serve_cmd(ctx, host: str, port: int, open_browser: bool, token: str | None):
     """Запустить локальный веб-дашборд для просмотра встреч.
 
     Открывает веб-интерфейс со списком сессий, медиаплеером,
     транскриптом, протоколом и summary-отчётом.
+
+    При запуске на не-локальном адресе (--host 0.0.0.0 и т.п.) дашборд
+    требует токен доступа: ссылка с токеном печатается при старте.
     """
     try:
         import uvicorn
@@ -963,12 +900,22 @@ def serve_cmd(ctx, host: str, port: int, open_browser: bool):
         sys.exit(1)
 
     cfg = ctx.obj["cfg"]
+    import secrets
+
     from meeting_recorder.dashboard import create_app
 
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        print("⚠️ Дашборд доступен из сети: аутентификации нет, встречи увидит любой.")
+    public = host not in ("127.0.0.1", "localhost", "::1")
+    if public and not token:
+        token = secrets.token_urlsafe(18)
+    if public:
+        print(
+            "⚠️ Дашборд доступен из сети. Доступ — только по ссылке с токеном; "
+            "передавайте её лишь доверенным людям (трафик не шифруется, HTTP)."
+        )
 
     url = f"http://{host}:{port}"
+    if token:
+        url += f"/?token={token}"
     print(f"\n🌐 Дашборд: {url}")
     print(f"   Встречи:  {cfg.output_dir}")
     print("   Остановить: Ctrl+C\n")
@@ -979,7 +926,11 @@ def serve_cmd(ctx, host: str, port: int, open_browser: bool):
 
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
-    app = create_app(cfg, allowed_hosts=None if host in ("0.0.0.0", "::") else [host])
+    app = create_app(
+        cfg,
+        allowed_hosts=None if host in ("0.0.0.0", "::") else [host],
+        access_token=token,
+    )
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
@@ -991,12 +942,21 @@ def serve_cmd(ctx, host: str, port: int, open_browser: bool):
     default="config.yaml",
     help="Путь для сохранения конфига",
 )
-def generate_config_cmd(output: str):
+@click.option(
+    "--force", is_flag=True, help="Перезаписать существующий файл конфигурации"
+)
+def generate_config_cmd(output: str, force: bool):
     """Сгенерировать шаблон config.yaml.
 
+    Существующий файл не перезаписывается без --force.
     Секреты из переменных окружения (HF_TOKEN, LLM_API_KEY) в файл не попадают.
     """
     from meeting_recorder.config import save_config
+
+    if Path(output).exists() and not force:
+        print(f"❌ Файл уже существует: {output}")
+        print("   Укажите другой путь (-o) или добавьте --force для перезаписи.")
+        sys.exit(1)
 
     save_config(AppConfig(), output)
     print(f"Шаблон config.yaml сохранён: {output}")

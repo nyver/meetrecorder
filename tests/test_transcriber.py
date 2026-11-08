@@ -18,8 +18,8 @@ from meeting_recorder.transcriber import (
     _model_cache,
     _patch_hf_use_auth_token,
     _patch_speechbrain_lazy_module,
-    _patch_torch_load_compat,
     _patch_torchaudio_compat,
+    _trusted_torch_load,
     load_transcript,
     transcribe,
     unload_models,
@@ -363,11 +363,8 @@ class TestCompatPatches:
         _patch_hf_use_auth_token()
         _patch_hf_use_auth_token()  # второй вызов не должен упасть
 
-    def test_patch_torch_load_idempotent(self):
-        _patch_torch_load_compat()
-        _patch_torch_load_compat()
-
-    def test_patch_torch_load_preserves_explicit_weights_only(self):
+    def test_trusted_torch_load_scoped(self):
+        """weights_only=False только внутри блока; снаружи torch.load исходный."""
         import torch
 
         original = torch.load
@@ -378,19 +375,27 @@ class TestCompatPatches:
             return object()
 
         torch.load = fake_load
-        if hasattr(torch, "_patched_weights_only"):
-            delattr(torch, "_patched_weights_only")
         try:
-            _patch_torch_load_compat()
-            torch.load("model.pt", weights_only=True)
+            with _trusted_torch_load():
+                torch.load("model.pt", weights_only=True)
+                torch.load("model.pt")
+            assert torch.load is fake_load  # восстановлен после выхода
             torch.load("model.pt")
         finally:
             torch.load = original
-            if hasattr(torch, "_patched_weights_only"):
-                delattr(torch, "_patched_weights_only")
 
-        assert calls[0]["weights_only"] is True
+        assert calls[0]["weights_only"] is True  # явное значение сохраняется
         assert calls[1]["weights_only"] is False
+        assert "weights_only" not in calls[2]  # вне блока — умолчание torch
+
+    def test_trusted_torch_load_restores_on_error(self):
+        import torch
+
+        original = torch.load
+        with pytest.raises(RuntimeError):
+            with _trusted_torch_load():
+                raise RuntimeError("boom")
+        assert torch.load is original
 
     def test_patch_speechbrain_lazy_module_no_speechbrain(self):
         with patch.dict(
@@ -421,3 +426,130 @@ class TestUnloadModels:
         _model_cache.clear()
         unload_models()  # не должно падать
         assert _model_cache == {}
+
+
+# ---------------------------------------------------------------------------
+# OOM-фолбэк, декодирование, сопоставление диаризации
+# ---------------------------------------------------------------------------
+
+
+class TestOomFallback:
+    def test_batch_fallbacks(self):
+        from meeting_recorder.transcriber import _batch_fallbacks
+
+        assert _batch_fallbacks(16) == [16, 8, 4, 0]
+        assert _batch_fallbacks(2) == [2, 0]
+
+    def test_retries_with_smaller_batch(self):
+        from meeting_recorder import transcriber as tr
+
+        calls = []
+
+        def fake_pass(model, audio, size, kwargs):
+            calls.append(size)
+            if size > 4:
+                raise RuntimeError("CUDA failed with error out of memory")
+            return ["seg"], "info"
+
+        with patch.object(tr, "_whisper_pass", side_effect=fake_pass):
+            with patch.object(tr, "_free_gpu_memory") as free:
+                segs, info = tr._transcribe_with_oom_fallback(None, None, 16, {})
+        assert calls == [16, 8, 4]
+        assert segs == ["seg"]
+        assert free.call_count == 2
+
+    def test_non_oom_error_not_retried(self):
+        from meeting_recorder import transcriber as tr
+
+        with patch.object(
+            tr, "_whisper_pass", side_effect=ValueError("bad audio")
+        ) as m:
+            with pytest.raises(ValueError):
+                tr._transcribe_with_oom_fallback(None, None, 16, {})
+        assert m.call_count == 1
+
+    def test_oom_on_last_attempt_raises(self):
+        from meeting_recorder import transcriber as tr
+
+        with patch.object(
+            tr, "_whisper_pass", side_effect=RuntimeError("out of memory")
+        ):
+            with patch.object(tr, "_free_gpu_memory"):
+                with pytest.raises(RuntimeError):
+                    tr._transcribe_with_oom_fallback(None, None, 8, {})
+
+    def test_whisper_pass_consumes_generator(self):
+        """Ошибки генератора faster-whisper возникают внутри _whisper_pass."""
+        from meeting_recorder.transcriber import _whisper_pass
+
+        def gen():
+            yield "a"
+            raise RuntimeError("out of memory")
+
+        model = MagicMock()
+        model.transcribe.return_value = (gen(), "info")
+        with pytest.raises(RuntimeError, match="out of memory"):
+            _whisper_pass(model, "x.wav", 0, {})
+
+
+class TestDecodeAudio:
+    def test_decode_real_wav(self, tmp_path):
+        from meeting_recorder.transcriber import _decode_audio
+
+        audio = _decode_audio(_make_wav(tmp_path / "a.wav"))
+        assert audio is not None and audio.dtype.name == "float32"
+
+    def test_decode_failure_returns_none(self, tmp_path):
+        from meeting_recorder.transcriber import _decode_audio
+
+        assert _decode_audio(tmp_path / "missing.wav") is None
+
+    def test_waveform_passed_to_pyannote(self, app_cfg):
+        import numpy as np
+
+        segs = [Segment(0.0, 1.0, "UNKNOWN", "a")]
+        pipeline = MagicMock()
+        pipeline.return_value.itertracks.return_value = []
+        _apply_diarization(
+            pipeline, Path("x.wav"), segs, app_cfg, waveform=np.zeros(16000, "float32")
+        )
+        arg = pipeline.call_args.args[0]
+        assert arg["sample_rate"] == 16000
+        assert tuple(arg["waveform"].shape) == (1, 16000)
+
+
+class TestSpeakerOverlaps:
+    def _brute(self, segments, turns):
+        result = []
+        for seg in segments:
+            acc = {}
+            for ts, te, sp in turns:
+                ov = min(seg.end, te) - max(seg.start, ts)
+                if ov > 0:
+                    acc[sp] = acc.get(sp, 0.0) + ov
+            result.append(acc)
+        return result
+
+    def test_matches_bruteforce_with_overlapping_turns(self):
+        import random
+
+        from meeting_recorder.transcriber import _speaker_overlaps
+
+        rnd = random.Random(1)
+        segments = []
+        t = 0.0
+        for _ in range(200):
+            d = rnd.uniform(0.5, 8)
+            segments.append(Segment(t, t + d, "UNKNOWN", ""))
+            t += rnd.uniform(0.2, 6)  # сегменты могут перекрываться
+        turns = []
+        for _ in range(300):
+            st = rnd.uniform(0, t)
+            turns.append((st, st + rnd.uniform(0.1, 30), rnd.choice("ABC")))
+        turns.sort(key=lambda x: x[0])
+        fast = _speaker_overlaps(segments, turns)
+        slow = self._brute(segments, turns)
+        for f, sl in zip(fast, slow, strict=True):
+            assert f.keys() == sl.keys()
+            for k in f:
+                assert f[k] == pytest.approx(sl[k])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -29,7 +30,8 @@ def mock_cfg(tmp_path) -> AppConfig:
 def app(mock_cfg, tmp_path) -> TrayApp:
     tray = TrayApp(mock_cfg, config_path=tmp_path / "config.yaml")
     tray._icon = MagicMock()
-    return tray
+    yield tray
+    tray._release_recording()  # lock записи не должен «утечь» в другие тесты
 
 
 def _make_session(
@@ -353,6 +355,7 @@ class TestDoStart:
         mock_paths = MagicMock()
         mock_paths.session_id = "meeting_2026-01-01_00-00-00"
         mock_recorder = MagicMock()
+        mock_recorder.ffmpeg_pid = 1234
 
         with patch("meeting_recorder.tray.create_session", return_value=mock_paths):
             with patch(
@@ -525,13 +528,104 @@ class TestOnExit:
         app._on_exit(mock_icon, MagicMock())
         mock_icon.stop.assert_called_once()
 
-    def test_exit_when_recording(self, app):
+    def test_exit_when_recording_does_not_block_ui(self, app):
+        """_on_exit возвращается сразу; остановка и выход — в фоновом потоке."""
         app._set_state("recording")
-        mock_icon = MagicMock()
-        with patch.object(app, "_do_stop"):
+        app._icon = MagicMock()
+        release = threading.Event()
+
+        def slow_stop():
+            release.wait(5)
+            return None
+
+        with patch.object(app, "_do_stop_and_mix", side_effect=slow_stop) as m:
+            app._on_exit(app._icon, MagicMock())
+            # UI-поток свободен: иконка ещё не остановлена
+            app._icon.stop.assert_not_called()
+            release.set()
+            for t in threading.enumerate():
+                if t.name == "tray-exit-stop":
+                    t.join(5)
+        m.assert_called_once()
+        app._icon.stop.assert_called_once()
+        assert app._stop_event.is_set()
+
+    def test_exit_does_not_run_processing(self, app, tmp_path):
+        session = _make_session(tmp_path, mix=True)
+        app._icon = MagicMock()
+        with patch.object(app, "_do_stop_and_mix", return_value=session):
+            with patch("meeting_recorder.pipeline.process_session") as proc:
+                app._stop_then_exit()
+        proc.assert_not_called()
+        app._icon.notify.assert_called_once()
+        app._icon.stop.assert_called_once()
+
+    def test_exit_waits_for_pending_start(self, app):
+        app._icon = MagicMock()
+        app._start_finished.clear()
+        order = []
+
+        def finish_start():
+            time.sleep(0.2)
+            order.append("started")
+            app._start_finished.set()
+
+        threading.Thread(target=finish_start).start()
+        with patch.object(
+            app, "_do_stop_and_mix", side_effect=lambda: order.append("stop")
+        ):
+            app._stop_then_exit()
+        assert order == ["started", "stop"]
+
+    def test_exit_error_still_shuts_down(self, app):
+        app._icon = MagicMock()
+        with patch.object(app, "_do_stop_and_mix", side_effect=RuntimeError("x")):
+            app._stop_then_exit()
+        app._icon.stop.assert_called_once()
+
+
+class TestRecordingLock:
+    def test_start_refused_when_lock_busy(self, app):
+        from meeting_recorder import state
+
+        held = state.acquire_recording_lock()
+        try:
+            assert app._try_begin("starting")
             with patch("meeting_recorder.tray.time.sleep"):
-                app._on_exit(mock_icon, MagicMock())
-        mock_icon.stop.assert_called_once()
+                with patch("meeting_recorder.tray.MeetingRecorder") as rec_cls:
+                    app._do_start()
+            rec_cls.assert_not_called()
+            assert app.state == "idle"
+        finally:
+            state.release_recording_lock(held)
+
+    def test_start_holds_lock_and_writes_tray_state(self, app):
+        from meeting_recorder import state
+
+        app._try_begin("starting")
+        with patch("meeting_recorder.tray.MeetingRecorder") as rec_cls:
+            rec_cls.return_value.ffmpeg_pid = 4242
+            app._do_start()
+        try:
+            assert app.state == "recording"
+            assert state.is_recording_active()
+            st = state.load_state()
+            assert st["owner"] == "tray" and st["ffmpeg_pid"] == 4242
+        finally:
+            app._release_recording()
+        assert not state.is_recording_active()
+        assert state.load_state() is None
+
+    def test_failed_start_releases_lock(self, app):
+        from meeting_recorder import state
+
+        app._try_begin("starting")
+        with patch("meeting_recorder.tray.time.sleep"):
+            with patch("meeting_recorder.tray.MeetingRecorder") as rec_cls:
+                rec_cls.return_value.start.side_effect = RuntimeError("no mic")
+                app._do_start()
+        assert not state.is_recording_active()
+        assert app._start_finished.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -1063,10 +1157,27 @@ class TestChat:
         _make_session(tmp_path, transcript=True)
         (tmp_path / "config.yaml").write_text("{}", encoding="utf-8")
         with patch("meeting_recorder.tray.subprocess.Popen") as mock_popen:
-            with patch("meeting_recorder.tray.shutil.which", return_value=None):
-                app._do_chat()
-        args = mock_popen.call_args.args[0]
-        assert "chat" in args and "-c" in args
+            app._do_chat()
+        cmdline = mock_popen.call_args.args[0]
+        if sys.platform == "win32":
+            # Одна строка: cmd /s /k "<аргументы>" — внешние кавычки снимаются
+            assert cmdline.startswith('cmd /s /k "') and cmdline.endswith('"')
+            assert " chat " in cmdline and " -c " in cmdline
+        else:
+            assert "chat" in cmdline and "-c" in cmdline
+
+    def test_chat_command_quotes_paths_with_spaces(self, app, tmp_path):
+        if sys.platform != "win32":
+            pytest.skip("Windows-only quoting")
+        _make_session(tmp_path, transcript=True)
+        cfg_dir = tmp_path / "my config"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.yaml").write_text("{}", encoding="utf-8")
+        app._config_path = cfg_dir / "config.yaml"
+        with patch("meeting_recorder.tray.subprocess.Popen") as mock_popen:
+            app._do_chat()
+        cmdline = mock_popen.call_args.args[0]
+        assert f'"{cfg_dir / "config.yaml"}"' in cmdline
 
     def test_on_chat_runs_in_background(self, app):
         with patch.object(app, "_spawn") as mock_spawn:
