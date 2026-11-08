@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from . import state
 from .config import AppConfig
 from .html_report import generate_html_protocol
 from .naming import SessionPaths, resolve_session
@@ -111,6 +113,20 @@ def _rename_with_retry(
 # ---------------------------------------------------------------------------
 
 
+def _system_audio_offset(paths: SessionPaths) -> float:
+    if not paths.capture_timing.exists():
+        return 0.0
+    try:
+        timing = json.loads(paths.capture_timing.read_text(encoding="utf-8"))
+        offset = float(timing["system_audio_offset_sec"])
+        if not math.isfinite(offset):
+            raise ValueError("Смещение должно быть конечным числом")
+        return offset
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        logger.warning("Синхронизация аудио недоступна, выравниваю по началу: %s", exc)
+        return 0.0
+
+
 def finalize_recording(cfg: AppConfig, paths: SessionPaths) -> Path:
     """Подготовить аудио после остановки записи: свести mic + system в mix.
 
@@ -127,6 +143,7 @@ def finalize_recording(cfg: AppConfig, paths: SessionPaths) -> Path:
                 paths.system_audio,
                 paths.mix_audio,
                 cfg.recording.audio_sample_rate,
+                system_offset_sec=_system_audio_offset(paths),
             )
             logger.info("Аудио сведено: %s", paths.mix_audio)
         elif paths.mic_audio.exists():
@@ -151,9 +168,14 @@ def run_transcribe(cfg: AppConfig, paths: SessionPaths) -> dict[str, Any]:
     """Транскрибировать сессию."""
     audio_path = paths.mix_audio
     if not audio_path.exists():
-        raise PipelineError(
-            f"Аудиофайл не найден: {audio_path}. Сначала выполните запись."
-        )
+        active = state.load_state()
+        if (
+            active
+            and active.get("session_id") == paths.session_id
+            and state.is_recording_active()
+        ):
+            raise PipelineError("Сессия ещё записывается — сначала остановите запись")
+        finalize_recording(cfg, paths)
 
     result = transcribe(
         audio_path,

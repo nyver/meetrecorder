@@ -214,6 +214,12 @@ class TestConfigHelpers:
         """max_tokens больше половины контекста — под ответ резервируется половина."""
         llm = LLMConfig(context_tokens=8192, max_tokens=16384)
         assert llm.input_token_budget() == 8192 - 4096 - 1024
+        assert llm.output_token_budget() == 4096
+
+    def test_minimum_context_leaves_room_for_request_overhead(self):
+        llm = LLMConfig(context_tokens=2048)
+        assert 0 < llm.input_token_budget()
+        assert llm.input_token_budget() + llm.output_token_budget() < llm.context_tokens
 
     def test_new_defaults(self):
         cfg = AppConfig()

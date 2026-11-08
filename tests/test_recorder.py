@@ -144,25 +144,25 @@ class TestMixAudioFiles:
         assert sr == 48000
         assert len(data) > 0
 
-    def test_system_longer_trimmed(self, tmp_path):
-        """system_audio длиннее → обрезать с начала system."""
+    def test_system_longer_preserved(self, tmp_path):
+        """Без метаданных сохраняется вся более длинная дорожка."""
         mic = _make_wav(tmp_path / "mic.wav", 1.0)
         sys_ = _make_wav(tmp_path / "sys.wav", 2.0)  # в 2 раза длиннее
         out = tmp_path / "mix.wav"
         mix_audio_files(mic, sys_, out)
         data_out, _ = sf.read(str(out))
         data_mic, _ = sf.read(str(mic))
-        assert len(data_out) == len(data_mic)
+        assert len(data_out) == len(data_mic) * 2
 
-    def test_mic_longer_trimmed(self, tmp_path):
-        """mic длиннее → обрезать с начала mic."""
+    def test_mic_longer_preserved(self, tmp_path):
+        """Сбой system не обрезает микрофон."""
         mic = _make_wav(tmp_path / "mic.wav", 2.0)
         sys_ = _make_wav(tmp_path / "sys.wav", 1.0)
         out = tmp_path / "mix.wav"
         mix_audio_files(mic, sys_, out)
         data_out, _ = sf.read(str(out))
         data_sys, _ = sf.read(str(sys_))
-        assert len(data_out) == len(data_sys)
+        assert len(data_out) == len(data_sys) * 2
 
     def test_empty_file_raises(self, tmp_path):
         mic = tmp_path / "mic.wav"
@@ -170,7 +170,7 @@ class TestMixAudioFiles:
         # Пустые файлы
         sf.write(str(mic), np.zeros((0, 1), dtype=np.float32), 48000)
         sf.write(str(sys_), np.zeros((0, 1), dtype=np.float32), 48000)
-        with pytest.raises(ValueError, match="пустой"):
+        with pytest.raises(ValueError, match="пуст"):
             mix_audio_files(mic, sys_, tmp_path / "mix.wav")
 
     def test_streaming_blocks_match_full_mix(self, tmp_path):
@@ -186,10 +186,71 @@ class TestMixAudioFiles:
         mixed, _ = sf.read(str(out), dtype="float32")
         a16, _ = sf.read(str(tmp_path / "mic.wav"), dtype="float32")
         b16, _ = sf.read(str(tmp_path / "sys.wav"), dtype="float32")
-        expected = (a16 + b16[len(b16) - len(a16) :]) / 2
-        assert len(mixed) == len(a16)
+        expected = b16.copy()
+        expected[: len(a16)] = (a16 + b16[: len(a16)]) / 2
+        assert len(mixed) == len(b16)
         assert np.allclose(mixed, expected, atol=2e-4)
         assert not list(tmp_path.glob(".*part*"))
+
+    @pytest.mark.parametrize("offset", [-0.2, 0.2])
+    def test_system_offset_across_blocks(self, tmp_path, offset):
+        sr = 8000
+        mic = np.full(sr, 0.2, dtype=np.float32)
+        system = np.zeros(sr, dtype=np.float32)
+        system[sr // 2] = 0.8
+        sf.write(tmp_path / "mic.wav", mic, sr)
+        sf.write(tmp_path / "sys.wav", system, sr)
+        out = tmp_path / "mix.wav"
+        with patch("meeting_recorder.recorder._MIX_BLOCK_FRAMES", 700):
+            mix_audio_files(
+                tmp_path / "mic.wav",
+                tmp_path / "sys.wav",
+                out,
+                system_offset_sec=offset,
+            )
+        mixed, _ = sf.read(out)
+        expected_peak = round((0.5 + offset) * sr)
+        assert np.argmax(mixed) == expected_peak
+        assert len(mixed) == round((1 + max(offset, 0)) * sr)
+        if offset > 0:
+            assert mixed[0] == pytest.approx(0.2, abs=1e-4)
+        else:
+            assert mixed[-1] == pytest.approx(0.2, abs=1e-4)
+
+    def test_early_system_failure_keeps_mic_words(self, tmp_path):
+        sr = 8000
+        mic = np.zeros(sr * 10, dtype=np.float32)
+        mic[sr] = 0.8
+        mic[sr * 8] = 0.6
+        sf.write(tmp_path / "mic.wav", mic, sr)
+        sf.write(tmp_path / "sys.wav", np.zeros(sr * 3), sr)
+        out = tmp_path / "mix.wav"
+        mix_audio_files(tmp_path / "mic.wav", tmp_path / "sys.wav", out)
+        mixed, _ = sf.read(out)
+        assert len(mixed) == sr * 10
+        assert mixed[sr] == pytest.approx(0.4, abs=1e-4)
+        assert mixed[sr * 8] == pytest.approx(0.6, abs=1e-4)
+
+    @pytest.mark.parametrize("empty_track", ["mic", "sys"])
+    def test_one_empty_track_keeps_other(self, tmp_path, empty_track):
+        for name in ("mic", "sys"):
+            sf.write(
+                tmp_path / f"{name}.wav",
+                np.full(0 if name == empty_track else 800, 0.3),
+                8000,
+            )
+        out = tmp_path / "mix.wav"
+        mix_audio_files(tmp_path / "mic.wav", tmp_path / "sys.wav", out)
+        mixed, _ = sf.read(out)
+        assert len(mixed) == 800
+        assert np.allclose(mixed, 0.3, atol=1e-4)
+
+    @pytest.mark.parametrize("offset", [float("nan"), float("inf")])
+    def test_nonfinite_offset_rejected(self, tmp_path, offset):
+        mic = _make_wav(tmp_path / "mic.wav")
+        system = _make_wav(tmp_path / "sys.wav")
+        with pytest.raises(ValueError, match="конечным"):
+            mix_audio_files(mic, system, tmp_path / "mix.wav", system_offset_sec=offset)
 
     def test_stereo_input_uses_first_channel(self, tmp_path):
         stereo = np.zeros((4800, 2), dtype=np.float32)
@@ -441,6 +502,52 @@ class TestMuxVideo:
 
 
 class TestStartCleanup:
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt, RuntimeError])
+    def test_interrupted_start_stops_all_resources(self, app_cfg, tmp_session, failure):
+        recorder = MeetingRecorder(app_cfg, tmp_session)
+        proc = _make_mock_process()
+        capture = MagicMock()
+        capture.error = None
+        with (
+            patch("meeting_recorder.recorder.subprocess.Popen", return_value=proc),
+            patch("meeting_recorder.recorder.SystemAudioCapture", return_value=capture),
+            patch("meeting_recorder.recorder.time.sleep", side_effect=failure),
+            pytest.raises(failure),
+        ):
+            recorder.start()
+        proc.stdin.write.assert_called_with(b"q")
+        proc.wait.assert_called_once()
+        capture.signal_stop.assert_called_once()
+        capture.wait.assert_called_once()
+        assert not recorder.is_recording
+        assert recorder.ffmpeg_pid is None
+        assert recorder._stderr_file is None
+
+    def test_ddagrab_uses_lavfi_filter(self, app_cfg, tmp_session):
+        app_cfg.recording.screen_grabber = "ddagrab"
+        cmd = MeetingRecorder(app_cfg, tmp_session)._build_ffmpeg_cmd()
+        assert cmd[cmd.index("-f") + 1] == "lavfi"
+        graph = cmd[cmd.index("-i") + 1]
+        assert graph == "ddagrab=output_idx=0:framerate=20,hwdownload,format=bgra"
+        assert "0:v:0" in cmd
+
+    def test_timing_uses_first_system_block_even_after_failure(
+        self, app_cfg, tmp_session
+    ):
+        import json
+
+        _make_wav(tmp_session.mic_audio, duration_sec=10, sr=8000)
+        capture = MagicMock()
+        capture.started_at = 98.0
+        capture.error = RuntimeError("device disconnected at t=103")
+        recorder = MeetingRecorder(app_cfg, tmp_session)
+        recorder._sys_capture = capture
+        recorder._process = _make_mock_process()
+        with patch("meeting_recorder.recorder.time.monotonic", return_value=110.0):
+            recorder.stop()
+        timing = json.loads(tmp_session.capture_timing.read_text())
+        assert timing["system_audio_offset_sec"] == -2.0
+
     def test_cmd_build_failure_does_not_start_sys_capture(self, app_cfg, tmp_session):
         """Если микрофон не найден, поток системного звука не должен остаться работать."""
         app_cfg.recording.mic_device = ""

@@ -327,6 +327,59 @@ class TestRunHighlightsOnly:
 
 
 class TestRunProcess:
+    def test_recovers_raw_audio_before_transcribing(self, app_cfg, tmp_session):
+        sr = 8000
+        sf.write(tmp_session.mic_audio, np.full(sr * 2, 0.2), sr)
+        sf.write(tmp_session.system_audio, np.full(sr, 0.4), sr)
+
+        def transcribe_recovered(path, cfg, **kwargs):
+            mixed, actual_sr = sf.read(path)
+            assert actual_sr == sr
+            assert len(mixed) == sr * 2
+            assert mixed[0] == pytest.approx(0.3, abs=1e-4)
+            assert mixed[-1] == pytest.approx(0.2, abs=1e-4)
+            return {"session_id": tmp_session.session_id, "segments": []}
+
+        with (
+            patch(
+                "meeting_recorder.pipeline.transcribe", side_effect=transcribe_recovered
+            ),
+            patch("meeting_recorder.pipeline.run_report", return_value=(1, 2)),
+            patch("meeting_recorder.pipeline.release_models"),
+        ):
+            _, proto, summary = run_process(app_cfg, tmp_session.session_id)
+        assert (proto, summary) == (1, 2)
+        assert tmp_session.mic_audio.exists()
+        assert tmp_session.system_audio.exists()
+
+    def test_existing_mix_not_rebuilt(self, app_cfg, tmp_session):
+        _make_wav(tmp_session.mix_audio)
+        with (
+            patch("meeting_recorder.pipeline.finalize_recording") as finalize,
+            patch(
+                "meeting_recorder.pipeline.transcribe",
+                return_value={"session_id": tmp_session.session_id},
+            ),
+        ):
+            run_transcribe(app_cfg, tmp_session)
+        finalize.assert_not_called()
+
+    def test_active_recording_not_recovered(self, app_cfg, tmp_session):
+        _make_wav(tmp_session.mic_audio)
+        with (
+            patch(
+                "meeting_recorder.pipeline.state.load_state",
+                return_value={"session_id": tmp_session.session_id},
+            ),
+            patch(
+                "meeting_recorder.pipeline.state.is_recording_active", return_value=True
+            ),
+            pytest.raises(PipelineError, match="ещё записывается"),
+        ):
+            run_transcribe(app_cfg, tmp_session)
+        assert not tmp_session.mix_audio.exists()
+        assert tmp_session.mic_audio.exists()
+
     def test_runs_transcribe_and_report(self, app_cfg, tmp_session):
         _make_wav(tmp_session.mix_audio)
         data = {
@@ -368,6 +421,33 @@ from meeting_recorder.pipeline import (  # noqa: E402
 
 
 class TestFinalizeRecording:
+    def test_recorded_offset_aligns_system_without_truncating_mic(
+        self, app_cfg, tmp_session
+    ):
+        sr = 8000
+        sf.write(tmp_session.mic_audio, np.full(sr * 10, 0.2), sr)
+        system = np.zeros(sr * 5)
+        system[sr * 3] = 0.8
+        sf.write(tmp_session.system_audio, system, sr)
+        tmp_session.capture_timing.write_text('{"system_audio_offset_sec": -2.0}')
+        finalize_recording(app_cfg, tmp_session)
+        mixed, _ = sf.read(tmp_session.mix_audio)
+        assert len(mixed) == sr * 10
+        assert np.argmax(mixed) == sr  # system t=3 относится к mic t=1
+        assert mixed[-1] == pytest.approx(0.2, abs=1e-4)
+
+    @pytest.mark.parametrize(
+        "timing", ["bad json", "[]", "{}", '{"system_audio_offset_sec": "NaN"}']
+    )
+    def test_invalid_timing_falls_back_to_start_alignment(
+        self, app_cfg, tmp_session, timing
+    ):
+        _make_wav(tmp_session.mic_audio, duration=2)
+        _make_wav(tmp_session.system_audio, duration=1)
+        tmp_session.capture_timing.write_text(timing)
+        finalize_recording(app_cfg, tmp_session)
+        assert sf.info(tmp_session.mix_audio).duration == 2
+
     def test_mix_both(self, app_cfg, tmp_session):
         _make_wav(tmp_session.mic_audio)
         _make_wav(tmp_session.system_audio)

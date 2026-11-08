@@ -188,6 +188,34 @@ class TestGetTranscribeModel:
 
 
 class TestTranscribe:
+    @pytest.mark.parametrize("language", ["auto", " AUTO ", ""])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_auto_language_passes_none_to_whisper(
+        self, app_cfg, tmp_path, language, batched
+    ):
+        audio = _make_wav(tmp_path / "audio.wav")
+        app_cfg.transcription.language = language
+        app_cfg.transcription.diarization = False
+        app_cfg.transcription.device = "cpu"
+        app_cfg.transcription.batch_size = 4 if batched else 0
+        model = self._mock_model(language="en")
+        batch = MagicMock()
+        batch.transcribe.return_value = (
+            iter([_make_fake_segment()]),
+            _make_fake_info(language="en"),
+        )
+        with (
+            patch(
+                "meeting_recorder.transcriber._get_transcribe_model", return_value=model
+            ),
+            patch("faster_whisper.BatchedInferencePipeline", return_value=batch),
+        ):
+            result = transcribe(audio, app_cfg)
+        backend = batch if batched else model
+        assert backend.transcribe.call_args.kwargs["language"] is None
+        assert backend.transcribe.call_args.kwargs["initial_prompt"] is None
+        assert result["language"] == "en"
+
     def _mock_model(self, texts=("Hello",), language="ru", duration=5.0):
         model = MagicMock()
         fake_segs = [_make_fake_segment(i, i + 1, t) for i, t in enumerate(texts)]

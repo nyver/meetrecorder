@@ -523,6 +523,54 @@ class TestOpenFolders:
 
 
 class TestOnExit:
+    @pytest.mark.parametrize("phase", ["stop", "mix"])
+    def test_exit_waits_for_in_progress_save(self, app, tmp_path, phase):
+        session = _make_session(tmp_path)
+        recorder = MagicMock()
+        app._recorder = recorder
+        app._paths = session
+        app._set_state("recording")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def pause(*args):
+            entered.set()
+            assert release.wait(5)
+
+        recorder.stop.side_effect = pause if phase == "stop" else None
+        with (
+            patch(
+                "meeting_recorder.pipeline.finalize_recording",
+                side_effect=pause if phase == "mix" else None,
+            ),
+            patch.object(app, "_do_process") as process,
+        ):
+            worker = threading.Thread(target=app._do_stop, daemon=True)
+            worker.start()
+            try:
+                assert entered.wait(5)
+                app._on_exit(app._icon, None)
+                app._icon.stop.assert_not_called()
+                assert not app._try_begin("starting")
+            finally:
+                release.set()
+                worker.join(5)
+                for thread in threading.enumerate():
+                    if thread.name == "tray-exit-stop":
+                        thread.join(5)
+        assert not worker.is_alive()
+        recorder.stop.assert_called_once()
+        process.assert_not_called()
+        app._icon.stop.assert_called_once()
+
+    def test_repeated_exit_does_not_shutdown_while_saving(self, app):
+        app._save_finished.clear()
+        with patch("meeting_recorder.tray.threading.Thread") as thread:
+            app._on_exit(app._icon, None)
+            app._on_exit(app._icon, None)
+        thread.assert_called_once()
+        app._icon.stop.assert_not_called()
+
     def test_exit_when_idle(self, app):
         mock_icon = MagicMock()
         app._on_exit(mock_icon, MagicMock())
@@ -585,6 +633,44 @@ class TestOnExit:
 
 
 class TestRecordingLock:
+    def test_state_write_failure_stops_recorder_before_unlock(self, app):
+        from meeting_recorder import state
+
+        def stop_while_locked():
+            assert state.is_recording_active()
+
+        with (
+            patch("meeting_recorder.tray.MeetingRecorder") as rec_cls,
+            patch(
+                "meeting_recorder.tray._state.save_state",
+                side_effect=OSError("disk full"),
+            ),
+            patch.object(app, "_flash"),
+        ):
+            rec_cls.return_value.stop.side_effect = stop_while_locked
+            app._save_finished.clear()
+            app._do_start()
+        rec_cls.return_value.start.assert_called_once()
+        rec_cls.return_value.stop.assert_called_once()
+        assert app._recorder is None
+        assert not state.is_recording_active()
+        assert state.load_state() is None
+        assert app._save_finished.is_set()
+        assert app._start_finished.is_set()
+
+    def test_lock_error_unblocks_exit(self, app):
+        app._save_finished.clear()
+        with (
+            patch(
+                "meeting_recorder.tray._state.acquire_recording_lock",
+                side_effect=OSError("denied"),
+            ),
+            patch.object(app, "_flash"),
+        ):
+            app._do_start()
+        assert app._save_finished.is_set()
+        assert app._start_finished.is_set()
+
     def test_start_refused_when_lock_busy(self, app):
         from meeting_recorder import state
 

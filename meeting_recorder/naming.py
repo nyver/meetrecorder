@@ -56,6 +56,7 @@ class SessionPaths:
         self.summary = self.dir / f"{session_id}_summary.md"
         self.html_protocol = self.dir / f"{session_id}_protocol.html"
         self.highlights = self.dir / f"{session_id}_highlights.json"
+        self.capture_timing = self.dir / f"{session_id}_capture.json"
 
     def ensure_dir(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)

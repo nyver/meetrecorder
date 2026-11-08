@@ -67,7 +67,6 @@ _TICK_SECS = 1.0  # период тикера (мигание иконки, та
 # Период опроса списка устройств в idle: каждый опрос запускает ffmpeg
 # (-list_devices), поэтому не чаще раза в 30 с; есть ручное «Обновить».
 _DEVICE_REFRESH_SECS = 30
-_STARTING_WAIT_SECS = 30  # при выходе: ожидание завершения старта записи
 _MAX_SESSIONS_IN_MENU = 25
 
 
@@ -137,6 +136,9 @@ class TrayApp:
         self._stop_event = threading.Event()
         self._start_finished = threading.Event()  # нет незавершённого старта
         self._start_finished.set()
+        self._save_finished = threading.Event()
+        self._save_finished.set()
+        self._exiting = False
 
     # ------------------------------------------------------------------
     # Управление состоянием
@@ -165,7 +167,7 @@ class TrayApp:
         двойной клик по пункту меню не запустит операцию дважды.
         """
         with self._lock:
-            if self._state != State.IDLE:
+            if self._state != State.IDLE or self._exiting:
                 return False
             self._state = State(state)
             self._status_msg = msg or _STATE_LABELS.get(state, state)
@@ -342,6 +344,7 @@ class TrayApp:
             # Колбэки меню выполняются в одном UI-потоке: _on_exit не может
             # вклиниться между _try_begin и clear().
             self._start_finished.clear()
+            self._save_finished.clear()
             self._spawn(self._do_start, "tray-start")
 
     def _do_start(self) -> None:
@@ -352,13 +355,16 @@ class TrayApp:
 
     def _do_start_inner(self) -> None:
         # Тот же lock, что и у `mrec start`: одновременно пишет только один процесс
-        rec_lock = _state.acquire_recording_lock()
-        if rec_lock is None:
-            self._flash(
-                State.ERROR, "Запись уже идёт (mrec start)", _ERROR_DISPLAY_SECS
-            )
-            return
+        rec_lock = None
+        recorder = None
         try:
+            rec_lock = _state.acquire_recording_lock()
+            if rec_lock is None:
+                self._save_finished.set()
+                self._flash(
+                    State.ERROR, "Запись уже идёт (mrec start)", _ERROR_DISPLAY_SECS
+                )
+                return
             paths = create_session(self.cfg.output_dir)
             recorder = MeetingRecorder(self.cfg, paths)
             recorder.start()
@@ -373,8 +379,22 @@ class TrayApp:
                 self._paths = paths
                 self._rec_lock = rec_lock
             self._set_state(State.RECORDING, f"Запись: {paths.session_id}")
-        except Exception as exc:
-            _state.release_recording_lock(rec_lock)
+        except BaseException as exc:
+            try:
+                if recorder is not None:
+                    recorder.stop()
+            except Exception:
+                logger.exception("Не удалось остановить запись после ошибки старта")
+            finally:
+                with self._lock:
+                    self._recorder = None
+                    self._rec_lock = None
+                if rec_lock is not None:
+                    _state.remove_state()
+                _state.release_recording_lock(rec_lock)
+                self._save_finished.set()
+            if not isinstance(exc, Exception):
+                raise
             logger.error("Ошибка старта записи: %s", exc)
             self._flash(State.ERROR, str(exc)[:60], _ERROR_DISPLAY_SECS)
 
@@ -402,32 +422,37 @@ class TrayApp:
             recorder = self._recorder
             paths = self._paths
             self._recorder = None  # повторный stop не должен останавливать дважды
+            if recorder is not None and paths is not None:
+                self._save_finished.clear()
 
         if recorder is None or paths is None:
             return None
 
-        self._set_state(State.PROCESSING, "Останавливаю запись…")
         try:
-            recorder.stop()
-        except Exception as exc:
-            logger.error("Ошибка остановки ffmpeg: %s", exc)
-        finally:
-            self._release_recording()
+            self._set_state(State.PROCESSING, "Останавливаю запись…")
+            try:
+                recorder.stop()
+            except Exception as exc:
+                logger.error("Ошибка остановки ffmpeg: %s", exc)
+            finally:
+                self._release_recording()
 
-        self._set_state(State.PROCESSING, "Свожу аудио…")
-        try:
-            finalize_recording(self.cfg, paths)
-        except PipelineError as exc:
-            logger.error("Ошибка сведения аудио: %s", exc)
-            self._flash(
-                State.ERROR, f"Сведение аудио: {str(exc)[:60]}", _ERROR_DISPLAY_SECS
-            )
-            return None
-        return paths
+            self._set_state(State.PROCESSING, "Свожу аудио…")
+            try:
+                finalize_recording(self.cfg, paths)
+            except PipelineError as exc:
+                logger.error("Ошибка сведения аудио: %s", exc)
+                self._flash(
+                    State.ERROR, f"Сведение аудио: {str(exc)[:60]}", _ERROR_DISPLAY_SECS
+                )
+                return None
+            return paths
+        finally:
+            self._save_finished.set()
 
     def _do_stop(self) -> None:
         paths = self._do_stop_and_mix()
-        if paths is not None:
+        if paths is not None and not self._exiting:
             self._do_process(paths)
 
     def _do_stop_only(self) -> None:
@@ -1016,7 +1041,14 @@ class TrayApp:
         обработка (транскрипция, LLM) при выходе не запускается — сессию
         можно обработать позже (`mrec process` или пункт меню трея).
         """
-        if self.state in (State.RECORDING, State.STARTING):
+        with self._lock:
+            if self._exiting:
+                return
+            self._exiting = True
+        if (
+            self.state in (State.RECORDING, State.STARTING)
+            or not self._save_finished.is_set()
+        ):
             self._set_state(State.PROCESSING, "Сохраняю запись перед выходом…")
             threading.Thread(
                 target=self._stop_then_exit, daemon=False, name="tray-exit-stop"
@@ -1028,8 +1060,10 @@ class TrayApp:
         try:
             # Старт записи ещё идёт (поток tray-start) — дожидаемся его,
             # иначе ffmpeg останется работать после выхода.
-            self._start_finished.wait(_STARTING_WAIT_SECS)
+            self._start_finished.wait()
             paths = self._do_stop_and_mix()
+            # Другой stop-поток мог уже забрать recorder. Ждём его сведения.
+            self._save_finished.wait()
             if paths is not None:
                 logger.info(
                     "Запись сохранена при выходе; обработка: mrec process %s",

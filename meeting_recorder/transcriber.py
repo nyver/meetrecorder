@@ -388,7 +388,7 @@ def transcribe(
 
     tcfg = cfg.transcription
     device = tcfg.device
-    language = tcfg.language
+    language = tcfg.language.strip().lower()
 
     # Проверка GPU
     if device == "cuda":
@@ -422,7 +422,7 @@ def transcribe(
 
     transcribe_kwargs: dict = dict(
         beam_size=tcfg.beam_size,
-        language=language if language else None,
+        language=None if language in ("", "auto") else language,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
         initial_prompt=(

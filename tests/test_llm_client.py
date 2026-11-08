@@ -70,6 +70,48 @@ class TestLLMClientInit:
 
 
 class TestLLMClientChat:
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_output_limit_fits_context(self, stream):
+        cfg = _cfg(context_tokens=8192, max_tokens=16384)
+        with LLMClient(cfg) as client:
+            with (
+                patch.object(
+                    client,
+                    "_post_json",
+                    return_value={"choices": [{"message": {"content": "ok"}}]},
+                ) as post,
+                patch.object(client, "_chat_stream", return_value="ok") as streaming,
+            ):
+                client.chat(
+                    [{"role": "user", "content": "x" * (cfg.input_token_budget() * 2)}],
+                    stream=stream,
+                )
+                payload = (
+                    streaming.call_args.args[1] if stream else post.call_args.args[1]
+                )
+        assert payload["max_tokens"] == 4096
+
+    def test_large_prompt_reduces_output_budget(self):
+        with LLMClient(_cfg(context_tokens=2048)) as client:
+            with patch.object(
+                client,
+                "_post_json",
+                return_value={"choices": [{"message": {"content": "ok"}}]},
+            ) as post:
+                client.chat([{"role": "user", "content": "x" * 3000}])
+        assert 0 < post.call_args.args[1]["max_tokens"] < 1024
+
+    def test_oversized_prompt_rejected_before_http(self):
+        from meeting_recorder.llm_client import LLMContextOverflowError
+
+        with LLMClient(_cfg(context_tokens=2048)) as client:
+            with (
+                patch.object(client, "_post_json") as post,
+                pytest.raises(LLMContextOverflowError),
+            ):
+                client.chat([{"role": "user", "content": "x" * 10000}])
+        post.assert_not_called()
+
     def _client_with_mock_http(self, mock_http: MagicMock) -> LLMClient:
         with patch("meeting_recorder.llm_client.httpx.Client") as mock_cls:
             mock_cls.return_value = mock_http

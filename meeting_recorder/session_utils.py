@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 TranscriptSource = dict[str, Any] | Path | str
 
+# Консервативная оценка для кириллицы в BPE-токенизаторах.
+CHARS_PER_TOKEN = 2.5
+
+
+def estimate_tokens(text: str) -> int:
+    """Оценка токенов для отчётов, чата и лимита HTTP-запроса к LLM."""
+    return int(len(text) / CHARS_PER_TOKEN) + 1
+
 
 _REPLACE_RETRIES = 10
 _REPLACE_DELAY = 0.3  # секунд между попытками

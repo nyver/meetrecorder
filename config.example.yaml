@@ -40,11 +40,15 @@ recording:
   # Имя capture-устройства (только для system_audio_grabber: dshow)
   system_audio_device: "Stereo Mix (Realtek High Definition Audio)"
 
-  # true — записывать системный звук, false — только микрофон
+  # true — записывать системный звук, false — только микрофон.
+  # При остановке смещение soundcard сохраняется в *_capture.json.
+  # Короткая дорожка дополняется тишиной: сбой system не обрезает mic.
+  # Без метаданных (старые/аварийные записи) дорожки выравниваются по началу.
   record_system_audio: true
 
   # Захват экрана:
-  #   ddagrab  — через DXGI Desktop Duplication (быстрее, требует ffmpeg >= 6.1)
+  #   ddagrab  — DXGI Desktop Duplication через lavfi-фильтр ddagrab
+  #              (быстрее, нужна сборка ffmpeg с этим фильтром)
   #   gdigrab  — GDI-захват (совместимее, но медленнее; не захватывает UAC/DRM)
   screen_grabber: "gdigrab"
 
@@ -64,7 +68,7 @@ transcription:
   #   medium          — компромисс, приемлем на CPU
   model: "large-v3-turbo"
 
-  # Язык аудио (ru, en, de, … — или auto для автоопределения)
+  # Язык аудио (ru, en, de, … — auto или "" для автоопределения Whisper)
   language: "ru"
 
   # true — включить диаризацию (определение говорящих через pyannote)
@@ -133,6 +137,9 @@ llm:
   context_tokens: 32768
 
   # Максимальное число токенов в ответе LLM.
+  # Фактический лимит — не больше половины context_tokens и свободного
+  # остатка контекста после оценки промпта (включая потоковые запросы).
+  # Например, context_tokens: 8192 ограничивает ответ 4096 токенами.
   # Для thinking-моделей (DeepSeek-R1 и аналогов) рекомендуется >= 16384.
   # Если ответ обрезан по лимиту: summary сохраняется с пометкой, чистка
   # протокола оставляет исходный текст.

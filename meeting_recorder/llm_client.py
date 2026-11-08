@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .config import LLMConfig
+from .session_utils import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -107,15 +108,22 @@ class LLMClient:
             LLMClientError: прочие ошибки (сеть, HTTP, формат ответа).
         """
         url = f"{self._base_url}/chat/completions"
+        # Та же оценка, что используется при разбиении отчётов на части.
+        prompt_tokens = sum(estimate_tokens(m["content"]) + 8 for m in messages)
+        available = self.config.context_tokens - prompt_tokens - 128
+        if available <= 0:
+            raise LLMContextOverflowError("Промпт не помещается в контекст модели")
+        requested = self.config.max_tokens if max_tokens is None else max_tokens
+        if requested <= 0:
+            raise LLMClientError("max_tokens должен быть положительным")
+        output_tokens = min(requested, self.config.output_token_budget(), available)
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
             "temperature": (
                 temperature if temperature is not None else self.config.temperature
             ),
-            "max_tokens": max_tokens
-            if max_tokens is not None
-            else self.config.max_tokens,
+            "max_tokens": output_tokens,
         }
 
         if stream:

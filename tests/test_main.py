@@ -422,7 +422,7 @@ class TestStopFfmpegGraceful:
     def test_process_already_gone(self):
         from meeting_recorder.__main__ import _stop_ffmpeg_graceful
 
-        with patch("os.kill", side_effect=ProcessLookupError):
+        with patch("meeting_recorder.__main__._is_ffmpeg_process", return_value=False):
             result = _stop_ffmpeg_graceful(99999)
         assert result is True
 

@@ -89,6 +89,12 @@ transcript and the dialogue history. Token counts are estimated conservatively
 (2.5 characters per token); if the server still reports a context overflow, the
 request is repeated automatically with 2× and then 4× smaller parts.
 
+The effective output limit is capped at half of `context_tokens` and reduced
+further when the estimated prompt leaves less room. For example, with a context
+of 8192, `max_tokens: 16384` results in at most 4096 output tokens. Both regular
+and streaming requests use this limit. Set `transcription.language: auto` (or an
+empty string) to let Whisper detect the language.
+
 A response timeout (`llm.timeout`) is **not** retried — a generation that did not
 fit the timeout would only hit it again; increase `timeout` or decrease `max_tokens`.
 
@@ -143,6 +149,10 @@ same lock file. `mrec start` refuses to start while the tray is recording, and
 (the menu stays responsive), then closes the tray. Transcription and reports are
 not started on exit — process the session later with `mrec process <session_id>`
 or the tray menu.
+
+Exit also waits when Stop has already started saving the recording. A failed
+start, including an error writing the session state, stops the capture resources
+before releasing the recording lock. Ctrl+C during CLI startup does the same.
 
 #### Recording devices submenu
 
@@ -215,6 +225,10 @@ mrec generate-config -o config.yaml
 ```
 
 All commands that accept `session_id` default to the last eligible session when omitted.
+
+After Ctrl+C or an interrupted recording, `mrec process <session_id>` rebuilds a
+missing mix from the available microphone/system WAV files before transcription.
+It keeps an existing mix and refuses to recover a session that is still recording.
 
 ### Web Dashboard
 
@@ -290,7 +304,8 @@ Each session is stored in `output_dir/meeting_YYYY-MM-DD_HH-MM-SS/`:
 | `*.mp4` | Screen recording (no audio) |
 | `*_mic.wav` | Microphone recording |
 | `*_system.wav` | System audio recording |
-| `*_mix.wav` | Mixed audio (mic + system, end-aligned) |
+| `*_mix.wav` | Mixed audio; shorter tracks are padded with silence |
+| `*_capture.json` | System audio start offset relative to the microphone |
 | `*_final.mp4` | Final video with audio (`mux` or `recording.auto_mux`) |
 | `*_transcript.json` | Transcript with diarization (raw `SPEAKER_XX` labels) |
 | `*_protocol.md` | Meeting protocol (Markdown) |
@@ -326,7 +341,7 @@ meeting_recorder/
 
 ```
 Recording (ffmpeg + soundcard)
-  → finalize_recording: mix_audio_files (end-aligned, averaged, streamed in blocks)
+  → finalize_recording: mix_audio_files (timing offset, silence padding, streamed in blocks)
   → Transcription (faster-whisper + pyannote diarization; audio decoded once,
     batch size halved automatically on CUDA out-of-memory)
   → Protocol (Markdown, verbatim with timestamps)
@@ -371,6 +386,13 @@ llama-server -m your-model.gguf --host 127.0.0.1 --port 8080 --ctx-size 32768
 
 - Audio mixing and resampling are streamed — memory does not grow with meeting
   length (previously ~2.5–3 GB per hour of recording).
+- Mixing preserves the microphone and any later system audio, even if one track
+  ends early. Overlapping tracks are averaged; a lone track retains its volume.
+  The system audio offset is saved on normal stop from its first captured block
+  and the microphone duration at stop. Audio before the microphone timeline is
+  skipped. If timing metadata is unavailable (older or interrupted sessions),
+  tracks are aligned at their starts; their original offset cannot be recovered
+  reliably from file lengths alone.
 - The mix is decoded once to 16 kHz mono and shared by Whisper and pyannote.
 - `*_mix.wav` and `*_final.mp4` are written to temporary files and renamed only on
   success, so an interrupted mix/mux never leaves a broken artifact behind.

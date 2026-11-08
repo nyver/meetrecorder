@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 from .config import AppConfig
 from .naming import SessionPaths
 from .session_utils import (
+    CHARS_PER_TOKEN as _CHARS_PER_TOKEN,  # noqa: F401 — обратная совместимость
+)
+from .session_utils import (
     atomic_write_text,
+    estimate_tokens,
     load_transcript_data,
     normalize_highlights,
     normalize_segments,
@@ -30,10 +34,6 @@ logger = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-# Консервативная оценка: для кириллицы типичные BPE-токенизаторы (Qwen, Llama)
-# дают ~2.5–3.5 символа на токен, для латиницы ~4. Берём нижнюю границу
-# (больше токенов на тот же текст), чтобы не переполнить контекст.
-_CHARS_PER_TOKEN = 2.5
 # Если сервер всё же ответил «контекст переполнен» — повторяем с чанками
 # меньшего размера (доля от расчётного бюджета).
 _OVERFLOW_SCALES = (1.0, 0.5, 0.25)
@@ -71,11 +71,6 @@ def _read_prompt(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Бюджет контекста и чанкинг
 # ---------------------------------------------------------------------------
-
-
-def estimate_tokens(text: str) -> int:
-    """Грубая (завышенная) оценка числа токенов в тексте."""
-    return int(len(text) / _CHARS_PER_TOKEN) + 1
 
 
 def _input_budget(cfg: AppConfig, scale: float = 1.0) -> int:

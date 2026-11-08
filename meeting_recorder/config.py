@@ -92,10 +92,13 @@ class LLMConfig(BaseModel):
             self._secret_from_env = True
         return self
 
+    def output_token_budget(self) -> int:
+        """Лимит ответа, согласованный с резервом входного контекста."""
+        return min(self.max_tokens, self.context_tokens // 2)
+
     def input_token_budget(self) -> int:
         """Сколько токенов можно отдать под промпт, оставив место под ответ."""
-        reserve = min(self.max_tokens, self.context_tokens // 2)
-        return max(self.context_tokens - reserve - 1024, 1024)
+        return max(self.context_tokens - self.output_token_budget() - 1024, 1)
 
 
 class AppConfig(BaseModel):

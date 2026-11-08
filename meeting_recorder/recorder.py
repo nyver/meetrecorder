@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import re
 import subprocess
 import sys
@@ -16,7 +18,7 @@ import soundfile as sf
 
 from .config import AppConfig
 from .naming import SessionPaths
-from .session_utils import replace_with_retry
+from .session_utils import atomic_write_text, replace_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +70,12 @@ class SystemAudioCapture:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.error: Exception | None = None
+        self.started_at: float | None = None
 
     def start(self) -> None:
         self._stop_event.clear()
+        self.error = None
+        self.started_at = None
         self._thread = threading.Thread(
             target=self._record, daemon=True, name="sys-audio"
         )
@@ -122,7 +127,6 @@ class SystemAudioCapture:
             frames_written = 0
             frames_padded = 0
             gap_limit = int(self._sr * _SYS_AUDIO_GAP_TOLERANCE)
-            t0: float | None = None
             with loopback.recorder(
                 samplerate=self._sr, channels=1, blocksize=self._chunk_frames
             ) as rec:
@@ -135,15 +139,17 @@ class SystemAudioCapture:
                 ) as out:
                     while not self._stop_event.is_set():
                         chunk = rec.record(numframes=self._chunk_frames)
-                        if t0 is None:
-                            t0 = time.monotonic() - len(chunk) / self._sr
+                        if self.started_at is None:
+                            self.started_at = time.monotonic() - len(chunk) / self._sr
                         out.write(chunk)
                         frames_written += len(chunk)
                         # Компенсация разрывов (переполнение буфера WASAPI, когда
                         # поток не успел забрать данные): дорожка должна идти
-                        # синхронно с настенными часами, иначе mix_audio_files,
-                        # выравнивающий дорожки по концу, сдвинет system-трек.
-                        gap = int((time.monotonic() - t0) * self._sr) - frames_written
+                        # синхронно с настенными часами.
+                        gap = (
+                            int((time.monotonic() - self.started_at) * self._sr)
+                            - frames_written
+                        )
                         if gap > gap_limit:
                             out.write(np.zeros((gap, 1), dtype=np.float32))
                             frames_written += gap
@@ -274,12 +280,15 @@ def mix_audio_files(
     system_path: Path,
     output_path: Path,
     sample_rate: int = 48000,
+    *,
+    system_offset_sec: float = 0.0,
 ) -> Path:
     """Свести два WAV-файла в один моно-файл (смешивание по среднему).
 
     Обработка потоковая, блоками по _MIX_BLOCK_FRAMES: память не зависит от
     длительности встречи. Результат пишется во временный файл и атомарно
-    переименовывается — недописанный mix не останется на диске.
+    переименовывается — недописанный mix не останется на диске. Смещение system
+    задаётся относительно начала mic; недостающие участки дополняются тишиной.
     """
     mic_path, system_path, output_path = (
         Path(mic_path),
@@ -288,8 +297,10 @@ def mix_audio_files(
     )
     info_mic = sf.info(str(mic_path))
     info_sys = sf.info(str(system_path))
-    if info_mic.frames == 0 or info_sys.frames == 0:
-        raise ValueError("Один из аудиофайлов пустой")
+    if info_mic.frames == 0 and info_sys.frames == 0:
+        raise ValueError("Оба аудиофайла пустые")
+    if not math.isfinite(system_offset_sec):
+        raise ValueError("Смещение аудио должно быть конечным числом")
 
     sr = info_mic.samplerate
     resampled: Path | None = None
@@ -303,19 +314,11 @@ def mix_audio_files(
             system_path = resampled
             info_sys = sf.info(str(system_path))
 
-        # Выравниваем по концу записи, а не по началу.
-        # soundcard стартует раньше ffmpeg (~2-5 с на инициализацию gdigrab/dshow),
-        # поэтому _system.wav длиннее — лишние кадры в начале, а не в конце.
-        # Пропускаем лишнее с начала более длинного файла.
-        skip_mic = max(info_mic.frames - info_sys.frames, 0)
-        skip_sys = max(info_sys.frames - info_mic.frames, 0)
-        if skip_mic or skip_sys:
-            logger.debug(
-                "Синхронизация аудио: пропущено %.2f с с начала %s",
-                max(skip_mic, skip_sys) / sr,
-                "mic" if skip_mic else "system",
-            )
-        remaining = min(info_mic.frames, info_sys.frames)
+        offset = round(system_offset_sec * sr)
+        skip_sys = min(max(-offset, 0), info_sys.frames)
+        delay_sys = max(offset, 0)
+        system_frames = info_sys.frames - skip_sys
+        total = max(info_mic.frames, delay_sys + system_frames if system_frames else 0)
 
         with (
             sf.SoundFile(str(mic_path)) as f_mic,
@@ -329,17 +332,21 @@ def mix_audio_files(
                 format="WAV",
             ) as out,
         ):
-            f_mic.seek(skip_mic)
             f_sys.seek(skip_sys)
-            while remaining > 0:
-                n = min(_MIX_BLOCK_FRAMES, remaining)
+            position = 0
+            while position < total:
+                n = min(_MIX_BLOCK_FRAMES, total - position)
+                mixed = np.zeros(n, dtype=np.float32)
+                weights = np.zeros(n, dtype=np.uint8)
                 a = f_mic.read(n, dtype="float32", always_2d=True)[:, 0]
-                b = f_sys.read(n, dtype="float32", always_2d=True)[:, 0]
-                m = min(len(a), len(b))
-                if m == 0:
-                    break
-                out.write((a[:m] + b[:m]) * 0.5)
-                remaining -= m
+                mixed[: len(a)] += a
+                weights[: len(a)] += 1
+                begin = min(max(delay_sys - position, 0), n)
+                b = f_sys.read(n - begin, dtype="float32", always_2d=True)[:, 0]
+                mixed[begin : begin + len(b)] += b
+                weights[begin : begin + len(b)] += 1
+                out.write(mixed / np.maximum(weights, 1))
+                position += n
 
         replace_with_retry(tmp_out, output_path)
     finally:
@@ -374,7 +381,19 @@ class MeetingRecorder:
         """Начать запись экрана + микрофон + системный звук."""
         if self._recording:
             raise RuntimeError("Запись уже идёт")
+        try:
+            self._start_capture()
+        except BaseException:
+            # KeyboardInterrupt тоже требует остановить уже запущенные ресурсы.
+            try:
+                self.stop()
+            except Exception:
+                logger.exception("Не удалось освободить ресурсы после ошибки старта")
+            finally:
+                self._close_stderr()
+            raise
 
+    def _start_capture(self) -> None:
         rc = self.config.recording
 
         # Команду собираем ДО запуска захвата системного звука: она может упасть
@@ -504,16 +523,13 @@ class MeetingRecorder:
 
     def stop(self) -> None:
         """Gracefully остановить запись (отправить 'q' во stdin)."""
-        if not self._recording or self._process is None:
+        if self._process is None and self._sys_capture is None:
             logger.warning("Запись не идёт — stop вызван без start")
             return
 
-        # Отправляем 'q' для graceful stop ffmpeg и одновременно сигнализируем
-        # soundcard-захвату, чтобы оба потока завершились в одно время.
-        # Важно: если сначала ждать ffmpeg.wait() и только потом останавливать
-        # soundcard, system_audio.wav будет длиннее на время flush-а ffmpeg
-        # (2-5 с), и mix_audio_files срежет эти секунды с начала system-трека,
-        # сдвигая его вперёд относительно mic.
+        stopped_at = time.monotonic()
+        ffmpeg_running = self._process is not None and self._process.poll() is None
+        # Сигнализируем обоим захватам до ожидания flush ffmpeg.
         self._send_quit()
         if self._sys_capture is not None:
             self._sys_capture.signal_stop()
@@ -529,7 +545,13 @@ class MeetingRecorder:
                     logger.error(
                         "Системный звук не записан: %s", self._sys_capture.error
                     )
+                if ffmpeg_running:
+                    self._save_capture_timing(stopped_at)
                 self._sys_capture = None
+            if self._process is not None:
+                if self._process.stdin:
+                    self._process.stdin.close()
+                self._process = None
 
         duration = time.monotonic() - self._start_time if self._start_time else 0
         logger.info(
@@ -537,6 +559,26 @@ class MeetingRecorder:
             self.paths.session_id,
             duration,
         )
+
+    def _save_capture_timing(self, stopped_at: float) -> None:
+        """Сохранить смещение начала system относительно mic.
+
+        Конец mic привязан к запросу остановки, а не к завершению flush ffmpeg.
+        Начало system измерено по первому полученному блоку: сбой захвата не
+        меняет его позицию на общей временной шкале.
+        """
+        started_at = self._sys_capture.started_at
+        if started_at is None or not self.paths.mic_audio.exists():
+            return
+        try:
+            mic = sf.info(str(self.paths.mic_audio))
+            mic_started_at = stopped_at - mic.duration
+            atomic_write_text(
+                self.paths.capture_timing,
+                json.dumps({"system_audio_offset_sec": started_at - mic_started_at}),
+            )
+        except Exception as exc:
+            logger.warning("Не удалось сохранить синхронизацию аудио: %s", exc)
 
     @property
     def is_recording(self) -> bool:
@@ -584,10 +626,14 @@ class MeetingRecorder:
 
         # Screen capture input differs by grabber
         if rc.screen_grabber == "ddagrab":
-            # ddagrab: hardware DDA capture, input is display index
-            screen_input = ["-f", "ddagrab", "-framerate", str(rc.fps), "-i", "0"]
-            # hwdownload needed to get CPU-accessible frames for libx264
-            video_filters = ["-vf", "hwdownload,format=bgr0"]
+            # ddagrab — source-фильтр, не формат входного устройства.
+            screen_input = [
+                "-f",
+                "lavfi",
+                "-i",
+                f"ddagrab=output_idx=0:framerate={rc.fps},hwdownload,format=bgra",
+            ]
+            video_filters = []
         else:
             # gdigrab: GDI capture, supports draw_mouse
             screen_input = [
